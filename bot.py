@@ -496,7 +496,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         working_dirs[chat_id] = result["cwd"]
     _save_state()
 
-    await reply(update, result["text"])
+    # Don't use reply() here — run_claude already printed to terminal
+    text = result["text"] or "(empty response)"
+    for i in range(0, len(text), MAX_MSG_LEN):
+        await update.message.reply_text(text[i : i + MAX_MSG_LEN])
 
 
 # ── Main ────────────────────────────────────────────────────────
