@@ -26,12 +26,33 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ── Per-chat state ──────────────────────────────────────────────
-sessions: dict[int, str] = {}        # chat_id -> session_id
-working_dirs: dict[int, str] = {}    # chat_id -> cwd
-models: dict[int, str] = {}          # chat_id -> model override
-
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 DEFAULT_CWD = os.path.expanduser("~")
 DEFAULT_MODEL = None  # use CLI default
+
+
+def _load_state() -> dict:
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_state():
+    data = {
+        "sessions": {str(k): v for k, v in sessions.items()},
+        "working_dirs": {str(k): v for k, v in working_dirs.items()},
+        "models": {str(k): v for k, v in models.items()},
+    }
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+_state = _load_state()
+sessions: dict[int, str] = {int(k): v for k, v in _state.get("sessions", {}).items()}
+working_dirs: dict[int, str] = {int(k): v for k, v in _state.get("working_dirs", {}).items()}
+models: dict[int, str] = {int(k): v for k, v in _state.get("models", {}).items()}
 
 MAX_MSG_LEN = 4096
 CREDENTIALS_PATH = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
@@ -162,7 +183,7 @@ def run_claude(prompt: str, session_id: str | None = None,
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, cwd=cwd, bufsize=1,  # line-buffered
+        text=True, cwd=cwd, bufsize=1, encoding="utf-8", errors="replace",
     )
 
     result_data = None
@@ -291,6 +312,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     old = sessions.pop(chat_id, None)
+    _save_state()
     await reply(update,
         f"Session cleared (was: {old[:12]}...)." if old else "Starting fresh."
     )
@@ -305,6 +327,7 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update,"Usage: /resume <session_id>")
         return
     sessions[chat_id] = args.strip()
+    _save_state()
     await reply(update,f"Resumed session: {args.strip()[:12]}...")
 
 
@@ -338,6 +361,7 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = os.path.normpath(os.path.join(current, target))
     if os.path.isdir(target):
         working_dirs[chat_id] = target
+        _save_state()
         await reply(update,f"Changed to: {target}")
     else:
         await reply(update,f"Not a directory: {target}")
@@ -367,6 +391,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update,f"Current model: {current}")
         return
     models[chat_id] = args
+    _save_state()
     await reply(update,f"Model set to: {args}")
 
 
@@ -469,6 +494,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sessions[chat_id] = result["session_id"]
     if result.get("cwd"):
         working_dirs[chat_id] = result["cwd"]
+    _save_state()
 
     await reply(update, result["text"])
 
