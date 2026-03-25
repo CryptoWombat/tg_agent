@@ -5,11 +5,13 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 load_dotenv()
@@ -55,6 +57,29 @@ working_dirs: dict[int, str] = {int(k): v for k, v in _state.get("working_dirs",
 models: dict[int, str] = {int(k): v for k, v in _state.get("models", {}).items()}
 
 MAX_MSG_LEN = 4096
+MAX_HISTORY = 20  # per chat
+_chat_locks: dict[int, asyncio.Lock] = {}  # per-chat concurrency locks
+_history: dict[int, list] = {}  # chat_id -> list of {"role", "text", "ts"}
+
+
+def _get_lock(chat_id: int) -> asyncio.Lock:
+    if chat_id not in _chat_locks:
+        _chat_locks[chat_id] = asyncio.Lock()
+    return _chat_locks[chat_id]
+
+
+def _record(chat_id: int, role: str, text: str):
+    """Append an exchange to per-chat history."""
+    if chat_id not in _history:
+        _history[chat_id] = []
+    _history[chat_id].append({
+        "role": role,
+        "text": text[:500],  # truncate for memory
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+    _history[chat_id] = _history[chat_id][-MAX_HISTORY:]
+
+
 CREDENTIALS_PATH = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
 USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
 
@@ -82,16 +107,69 @@ async def is_allowed(update: Update) -> bool:
     return True
 
 
+async def _keep_typing(chat):
+    """Send 'typing' action every 4s until cancelled."""
+    try:
+        while True:
+            await chat.send_action("typing")
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
+
+
+def _escape_md2(text: str) -> str:
+    """Escape special chars for Telegram MarkdownV2, preserving code blocks and inline code."""
+    # Extract code blocks and inline code, escape everything else
+    SPECIAL = r'_*[]()~`>#+=|{}.!-'
+    parts = []
+    pos = 0
+    # Match ```...``` blocks and `...` inline code
+    pattern = re.compile(r'(```[\s\S]*?```|`[^`\n]+`)')
+    for m in pattern.finditer(text):
+        # Escape text before this code span
+        before = text[pos:m.start()]
+        for ch in SPECIAL:
+            before = before.replace(ch, f'\\{ch}')
+        parts.append(before)
+        # Code blocks/inline code: only escape backslashes and backticks minimally
+        code = m.group(0)
+        if code.startswith('```'):
+            # Telegram expects ```lang\n...\n``` — keep as-is inside
+            inner = code[3:-3]
+            parts.append(f'```{inner}```')
+        else:
+            inner = code[1:-1]
+            parts.append(f'`{inner}`')
+        pos = m.end()
+    # Escape remaining text
+    tail = text[pos:]
+    for ch in SPECIAL:
+        tail = tail.replace(ch, f'\\{ch}')
+    parts.append(tail)
+    return ''.join(parts)
+
+
+async def _send_message(update: Update, text: str):
+    """Send a message with MarkdownV2 formatting, falling back to plain text."""
+    if not text:
+        text = "(empty response)"
+    for i in range(0, len(text), MAX_MSG_LEN):
+        chunk = text[i : i + MAX_MSG_LEN]
+        try:
+            await update.message.reply_text(
+                _escape_md2(chunk), parse_mode=ParseMode.MARKDOWN_V2
+            )
+        except Exception:
+            await update.message.reply_text(chunk)
+
+
 async def reply(update: Update, text: str):
     """Reply to the user in Telegram AND print both sides to the terminal."""
     c = COLORS
     user_text = update.message.text or ""
     print(f"\n{c['cyan']}{c['bold']}You:{c['reset']} {user_text}")
     print(f"{c['green']}{c['bold']}Bot:{c['reset']} {text}", flush=True)
-    if not text:
-        text = "(empty response)"
-    for i in range(0, len(text), MAX_MSG_LEN):
-        await update.message.reply_text(text[i : i + MAX_MSG_LEN])
+    await _send_message(update, text)
 
 
 # ── Terminal display ────────────────────────────────────────────
@@ -165,22 +243,13 @@ def _detect_cwd_change(event: dict, current_cwd: str) -> str | None:
 
 # ── Claude CLI runner ───────────────────────────────────────────
 
-def run_claude(prompt: str, session_id: str | None = None,
-               cwd: str | None = None, model: str | None = None) -> dict:
-    cwd = cwd or DEFAULT_CWD
-    cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
-           "--dangerously-skip-permissions"]
-    if session_id:
-        cmd.extend(["--resume", session_id])
-    if model:
-        cmd.extend(["--model", model])
-    cmd.append(prompt)
+MAX_RETRIES = 2
+RETRY_DELAY = 3  # seconds
 
+
+def _run_claude_once(cmd: list, cwd: str) -> dict:
+    """Execute claude CLI once, return parsed result dict."""
     c = COLORS
-    print(f"\n{c['cyan']}{c['bold']}You:{c['reset']} {prompt}")
-    print(f"{c['dim']}  cwd: {cwd}{c['reset']}")
-    sys.stdout.flush()
-
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, cwd=cwd, bufsize=1, encoding="utf-8", errors="replace",
@@ -211,7 +280,7 @@ def run_claude(prompt: str, session_id: str | None = None,
         proc.wait(timeout=600)
     except subprocess.TimeoutExpired:
         proc.kill()
-        return {"text": "Claude timed out.", "session_id": None, "cwd": cwd}
+        return {"text": "Claude timed out.", "session_id": None, "cwd": cwd, "_timeout": True}
 
     if result_data:
         return {
@@ -219,7 +288,46 @@ def run_claude(prompt: str, session_id: str | None = None,
             "session_id": result_data.get("session_id"),
             "cwd": detected_cwd or cwd,
         }
-    return {"text": "No response from Claude.", "session_id": None, "cwd": cwd}
+    # Non-zero exit or no result — transient failure
+    return {"text": "", "session_id": None, "cwd": cwd, "_failed": True}
+
+
+def run_claude(prompt: str, session_id: str | None = None,
+               cwd: str | None = None, model: str | None = None) -> dict:
+    import time
+    cwd = cwd or DEFAULT_CWD
+    cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
+           "--dangerously-skip-permissions"]
+    if session_id:
+        cmd.extend(["--resume", session_id])
+    if model:
+        cmd.extend(["--model", model])
+    cmd.append(prompt)
+
+    c = COLORS
+    print(f"\n{c['cyan']}{c['bold']}You:{c['reset']} {prompt}")
+    print(f"{c['dim']}  cwd: {cwd}{c['reset']}")
+    sys.stdout.flush()
+
+    for attempt in range(1, MAX_RETRIES + 2):  # 1 try + MAX_RETRIES retries
+        result = _run_claude_once(cmd, cwd)
+
+        if result.get("_timeout"):
+            result.pop("_timeout")
+            return result
+
+        if result.get("_failed") and attempt <= MAX_RETRIES:
+            print(f"  {c['yellow']}Retry {attempt}/{MAX_RETRIES}...{c['reset']}")
+            sys.stdout.flush()
+            time.sleep(RETRY_DELAY)
+            continue
+
+        result.pop("_failed", None)
+        if not result["text"]:
+            result["text"] = "No response from Claude."
+        return result
+
+    return {"text": "No response from Claude after retries.", "session_id": None, "cwd": cwd}
 
 
 # ── Usage API ───────────────────────────────────────────────────
@@ -298,7 +406,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Info:\n"
         "/usage - plan usage & rate limits\n"
         "/status - version & account info\n"
-        "/doctor - health check\n\n"
+        "/doctor - health check\n"
+        "/history - recent exchanges\n\n"
         "Skills (forwarded to Claude):\n"
         "/review /security_review /simplify\n"
         "/pr_comments /release_notes /init\n"
@@ -461,6 +570,23 @@ async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, output)
 
 
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    entries = _history.get(chat_id, [])
+    if not entries:
+        await reply(update, "No history yet.")
+        return
+    lines = []
+    for e in entries:
+        ts = e["ts"][:16].replace("T", " ")
+        role = "You" if e["role"] == "user" else "Bot"
+        preview = e["text"][:100] + ("..." if len(e["text"]) > 100 else "")
+        lines.append(f"[{ts}] {role}: {preview}")
+    await reply(update, "\n".join(lines))
+
+
 # ── Message handler (forwarding to Claude CLI) ─────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -472,34 +598,98 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    session_id = sessions.get(chat_id)
-    cwd = working_dirs.get(chat_id, DEFAULT_CWD)
-    model = models.get(chat_id)
 
-    # Show typing indicator
-    await update.effective_chat.send_action("typing")
+    async with _get_lock(chat_id):
+        session_id = sessions.get(chat_id)
+        cwd = working_dirs.get(chat_id, DEFAULT_CWD)
+        model = models.get(chat_id)
 
-    loop = asyncio.get_event_loop()
-    try:
-        result = await loop.run_in_executor(None, run_claude, text, session_id, cwd, model)
-    except subprocess.TimeoutExpired:
-        await reply(update,"Claude timed out (10 min limit).")
+        typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
+
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(None, run_claude, text, session_id, cwd, model)
+        except subprocess.TimeoutExpired:
+            await reply(update, "Claude timed out (10 min limit).")
+            return
+        except Exception as e:
+            print(f">>> ERROR: {e}", flush=True)
+            await reply(update, f"Error: {e}")
+            return
+        finally:
+            typing_task.cancel()
+
+        if result.get("session_id"):
+            sessions[chat_id] = result["session_id"]
+        if result.get("cwd"):
+            working_dirs[chat_id] = result["cwd"]
+        _save_state()
+
+        _record(chat_id, "user", text)
+        _record(chat_id, "bot", result["text"] or "(empty)")
+
+        # Don't use reply() here — run_claude already printed to terminal
+        await _send_message(update, result["text"])
+
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photos and documents — download and pass to Claude."""
+    if not await is_allowed(update):
         return
-    except Exception as e:
-        print(f">>> ERROR: {e}", flush=True)
-        await reply(update,f"Error: {e}")
+
+    chat_id = update.effective_chat.id
+    msg = update.message
+    caption = msg.caption or ""
+
+    # Determine what to download
+    if msg.photo:
+        file_obj = await msg.photo[-1].get_file()  # highest resolution
+        ext = ".jpg"
+    elif msg.document:
+        file_obj = await msg.document.get_file()
+        ext = os.path.splitext(msg.document.file_name or "")[1] or ".bin"
+    else:
         return
 
-    if result.get("session_id"):
-        sessions[chat_id] = result["session_id"]
-    if result.get("cwd"):
-        working_dirs[chat_id] = result["cwd"]
-    _save_state()
+    # Download to temp file
+    tmp_dir = tempfile.mkdtemp(prefix="tg_claude_")
+    filename = f"upload{ext}"
+    local_path = os.path.join(tmp_dir, filename)
+    await file_obj.download_to_drive(local_path)
 
-    # Don't use reply() here — run_claude already printed to terminal
-    text = result["text"] or "(empty response)"
-    for i in range(0, len(text), MAX_MSG_LEN):
-        await update.message.reply_text(text[i : i + MAX_MSG_LEN])
+    prompt = f"I've attached a file at {local_path}"
+    if caption:
+        prompt += f"\n\nUser says: {caption}"
+    else:
+        prompt += "\n\nPlease analyze this file."
+
+    async with _get_lock(chat_id):
+        session_id = sessions.get(chat_id)
+        cwd = working_dirs.get(chat_id, DEFAULT_CWD)
+        model = models.get(chat_id)
+
+        typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
+
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(None, run_claude, prompt, session_id, cwd, model)
+        except Exception as e:
+            print(f">>> ERROR: {e}", flush=True)
+            await reply(update, f"Error: {e}")
+            return
+        finally:
+            typing_task.cancel()
+
+        if result.get("session_id"):
+            sessions[chat_id] = result["session_id"]
+        if result.get("cwd"):
+            working_dirs[chat_id] = result["cwd"]
+        _save_state()
+
+        _record(chat_id, "user", caption or "[file]")
+        _record(chat_id, "bot", result["text"] or "(empty)")
+
+        await _send_message(update, result["text"])
 
 
 # ── Main ────────────────────────────────────────────────────────
@@ -528,12 +718,16 @@ def main():
     app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("doctor", cmd_doctor))
+    app.add_handler(CommandHandler("history", cmd_history))
 
     # Skills forwarded to CLI — registered as commands so Telegram
     # doesn't eat them; handler just forwards the text as-is
     for skill in CLI_SKILLS:
         safe = skill.replace("-", "_")
         app.add_handler(CommandHandler(safe, handle_message))
+
+    # Photos and documents
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_file))
 
     # Everything else (plain text + unknown /commands)
     app.add_handler(MessageHandler(filters.TEXT, handle_message))

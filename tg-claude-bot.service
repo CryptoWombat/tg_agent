@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Claude Code Bot
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/tg_agent
+EnvironmentFile=/opt/tg_agent/.env
+ExecStart=/usr/bin/python3 /opt/tg_agent/bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
