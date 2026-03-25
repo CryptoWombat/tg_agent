@@ -19,7 +19,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 load_dotenv()
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def _git_hash() -> str:
@@ -1088,10 +1088,13 @@ def main():
     async def _notify_startup(application):
         global _bot_ref
         _bot_ref = application.bot
-        await application.bot.send_message(
-            chat_id=ALLOWED_USER_ID,
-            text=f"Bot restarted — v{VERSION} · {BUILD_ID}\nLast changed: {BUILD_TIME}",
-        )
+        try:
+            await application.bot.send_message(
+                chat_id=ALLOWED_USER_ID,
+                text=f"Bot restarted — v{VERSION} · {BUILD_ID}\nLast changed: {BUILD_TIME}",
+            )
+        except Exception as e:
+            log.warning("Startup notification failed: %s", e)
 
     app.post_init = _notify_startup
 
