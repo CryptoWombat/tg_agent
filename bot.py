@@ -417,17 +417,14 @@ async def _check_usage_thresholds(bot):
             return
 
         alerts = []
-        bucket_labels = {
-            "five_hour": "5-hour session",
-            "seven_day": "Weekly quota",
-            "seven_day_opus": "Weekly Opus",
-        }
 
-        for key, label in bucket_labels.items():
-            bucket = data.get(key)
-            if not bucket:
+        for key, bucket in data.items():
+            if not isinstance(bucket, dict):
                 continue
-            pct = bucket.get("utilization", 0)
+            pct = bucket.get("utilization")
+            if pct is None:
+                continue
+            label = _BUCKET_LABELS.get(key, key.replace("_", " ").title())
             band = int(pct // 10)
             last_band = _last_usage_pct.get(key, -1)
 
@@ -723,6 +720,16 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, f"Model set to: {_model_name(model_id)}")
 
 
+# Friendly labels for known bucket keys; unknown keys shown as-is
+_BUCKET_LABELS = {
+    "five_hour":        "5-hour session",
+    "seven_day":        "Weekly quota",
+    "seven_day_opus":   "Weekly Opus",
+    "daily":            "Daily quota",
+    "monthly":          "Monthly quota",
+}
+
+
 async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
@@ -731,21 +738,17 @@ async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await loop.run_in_executor(None, _fetch_usage)
 
     if not data:
-        await reply(update,"Could not fetch usage data.")
+        await reply(update, "Could not fetch usage data.")
         return
 
-    USAGE_BUCKETS = [
-        ("five_hour",       "5-hour session"),
-        ("seven_day",       "Weekly quota"),
-        ("seven_day_opus",  "Weekly Opus"),
-    ]
-
     lines = []
-    for key, label in USAGE_BUCKETS:
-        bucket = data.get(key)
-        if not bucket:
+    for key, bucket in data.items():
+        if not isinstance(bucket, dict):
             continue
-        pct = bucket.get("utilization", 0)
+        pct = bucket.get("utilization")
+        if pct is None:
+            continue
+        label = _BUCKET_LABELS.get(key, key.replace("_", " ").title())
         resets_at = bucket.get("resets_at")
         bar = _progress_bar(pct)
         reset_str = f"  resets in {_time_until(resets_at)}" if resets_at else ""
