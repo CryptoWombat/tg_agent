@@ -3,9 +3,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.request
 from datetime import datetime, timezone
 
@@ -68,8 +70,12 @@ def _save_state():
         "models": {str(k): v for k, v in models.items()},
         "history": {str(k): v for k, v in _history.items()},
     }
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    tmp = STATE_FILE + ".tmp"
+    with _state_lock:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, STATE_FILE)
 
 
 _state = _load_state()
@@ -79,10 +85,13 @@ models: dict[int, str] = {int(k): v for k, v in _state.get("models", {}).items()
 
 MAX_MSG_LEN = 4096
 MAX_HISTORY = 20  # per chat
+_SESSION_ID_RE = re.compile(r'^[a-zA-Z0-9_-]{8,200}$')
 _chat_locks: dict[int, asyncio.Lock] = {}  # per-chat concurrency locks
 _active_procs: dict[int, subprocess.Popen] = {}  # chat_id -> running claude process
 _history: dict[int, list] = {int(k): v for k, v in _state.get("history", {}).items()}
 _last_usage_pct: dict[str, int] = {}  # bucket -> last reported 10% band
+_state_lock = threading.Lock()          # protects _save_state writes
+_active_procs_lock = threading.Lock()   # protects _active_procs dict
 _bot_ref = None  # set at startup for use in background tasks
 
 
@@ -282,7 +291,8 @@ def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None) -> dict:
     )
 
     if chat_id is not None:
-        _active_procs[chat_id] = proc
+        with _active_procs_lock:
+            _active_procs[chat_id] = proc
 
     result_data = None
     detected_cwd = None
@@ -311,7 +321,8 @@ def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None) -> dict:
         proc.kill()
         return {"text": "Claude timed out.", "session_id": None, "cwd": cwd, "_timeout": True}
     finally:
-        _active_procs.pop(chat_id, None)
+        with _active_procs_lock:
+            _active_procs.pop(chat_id, None)
 
     if proc.returncode == -9 or proc.returncode == -15:
         return {"text": "Cancelled.", "session_id": None, "cwd": cwd, "_cancelled": True}
@@ -400,7 +411,7 @@ def _progress_bar(pct: float, width: int = 20) -> str:
 async def _check_usage_thresholds(bot):
     """Fetch usage and notify if any quota crossed a new 10% band since last check."""
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, _fetch_usage)
         if not data:
             return
@@ -435,22 +446,25 @@ async def _check_usage_thresholds(bot):
 
 
 def _time_until(iso_ts: str) -> str:
-    target = datetime.fromisoformat(iso_ts)
-    if target.tzinfo is None:
-        target = target.replace(tzinfo=timezone.utc)
-    delta = target - datetime.now(timezone.utc)
-    total_secs = max(int(delta.total_seconds()), 0)
-    days, rem = divmod(total_secs, 86400)
-    hours, rem = divmod(rem, 3600)
-    mins, _ = divmod(rem, 60)
-    parts = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    if mins or not parts:
-        parts.append(f"{mins}m")
-    return " ".join(parts)
+    try:
+        target = datetime.fromisoformat(iso_ts)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        delta = target - datetime.now(timezone.utc)
+        total_secs = max(int(delta.total_seconds()), 0)
+        days, rem = divmod(total_secs, 86400)
+        hours, rem = divmod(rem, 3600)
+        mins, _ = divmod(rem, 60)
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if mins or not parts:
+            parts.append(f"{mins}m")
+        return " ".join(parts)
+    except (ValueError, TypeError):
+        return "unknown"
 
 
 # ── Bot command handlers ────────────────────────────────────────
@@ -515,9 +529,13 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args:
         await reply(update,"Usage: /resume <session_id>")
         return
-    sessions[chat_id] = args.strip()
+    sid = args.strip()
+    if not _SESSION_ID_RE.match(sid):
+        await reply(update, "Invalid session ID format.")
+        return
+    sessions[chat_id] = sid
     _save_state()
-    await reply(update,f"Resumed session: {args.strip()[:12]}...")
+    await reply(update, f"Resumed session: {sid[:12]}...")
 
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -709,7 +727,7 @@ async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, _fetch_usage)
 
     if not data:
@@ -740,12 +758,15 @@ async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
-    try:
-        ver = subprocess.run(
-            ["claude", "--version"], capture_output=True, text=True, timeout=5
-        ).stdout.strip()
-    except Exception:
-        ver = "unknown"
+    loop = asyncio.get_running_loop()
+    def _get_ver():
+        try:
+            return subprocess.run(
+                ["claude", "--version"], capture_output=True, text=True, timeout=5
+            ).stdout.strip()
+        except Exception:
+            return "unknown"
+    ver = await loop.run_in_executor(None, _get_ver)
 
     chat_id = update.effective_chat.id
     await reply(update,
@@ -761,13 +782,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
-    try:
-        result = subprocess.run(
-            ["claude", "doctor"], capture_output=True, text=True, timeout=15
-        )
-        output = (result.stdout + result.stderr).strip() or "No output."
-    except Exception as e:
-        output = f"Error: {e}"
+    loop = asyncio.get_running_loop()
+    def _run_doctor():
+        try:
+            r = subprocess.run(
+                ["claude", "doctor"], capture_output=True, text=True, timeout=15
+            )
+            return (r.stdout + r.stderr).strip() or "No output."
+        except Exception as e:
+            return f"Error: {e}"
+    output = await loop.run_in_executor(None, _run_doctor)
     await reply(update, output)
 
 
@@ -792,7 +816,8 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
     chat_id = update.effective_chat.id
-    proc = _active_procs.get(chat_id)
+    with _active_procs_lock:
+        proc = _active_procs.get(chat_id)
     if proc and proc.poll() is None:
         proc.terminate()
         await reply(update, "Cancelled running task.")
@@ -829,7 +854,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             result = await loop.run_in_executor(
                 None, lambda: run_claude(text, session_id, cwd, model, chat_id=chat_id)
@@ -880,51 +905,54 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Download to temp file
     tmp_dir = tempfile.mkdtemp(prefix="tg_claude_")
-    filename = f"upload{ext}"
-    local_path = os.path.join(tmp_dir, filename)
-    await file_obj.download_to_drive(local_path)
+    try:
+        filename = f"upload{ext}"
+        local_path = os.path.join(tmp_dir, filename)
+        await file_obj.download_to_drive(local_path)
 
-    prompt = f"I've attached a file at {local_path}"
-    if caption:
-        prompt += f"\n\nUser says: {caption}"
-    else:
-        prompt += "\n\nPlease analyze this file."
+        prompt = f"I've attached a file at {local_path}"
+        if caption:
+            prompt += f"\n\nUser says: {caption}"
+        else:
+            prompt += "\n\nPlease analyze this file."
 
-    lock = _get_lock(chat_id)
-    if lock.locked():
-        await update.message.reply_text("Queued — waiting for current task to finish...")
+        lock = _get_lock(chat_id)
+        if lock.locked():
+            await update.message.reply_text("Queued — waiting for current task to finish...")
 
-    async with lock:
-        session_id = sessions.get(chat_id)
-        cwd = working_dirs.get(chat_id, DEFAULT_CWD)
-        model = models.get(chat_id)
+        async with lock:
+            session_id = sessions.get(chat_id)
+            cwd = working_dirs.get(chat_id, DEFAULT_CWD)
+            model = models.get(chat_id)
 
-        typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
+            typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
 
-        loop = asyncio.get_event_loop()
-        try:
-            result = await loop.run_in_executor(
-                None, lambda: run_claude(prompt, session_id, cwd, model, chat_id=chat_id)
-            )
-        except Exception as e:
-            print(f">>> ERROR: {e}", flush=True)
-            await reply(update, f"Error: {e}")
-            return
-        finally:
-            typing_task.cancel()
+            loop = asyncio.get_running_loop()
+            try:
+                result = await loop.run_in_executor(
+                    None, lambda: run_claude(prompt, session_id, cwd, model, chat_id=chat_id)
+                )
+            except Exception as e:
+                print(f">>> ERROR: {e}", flush=True)
+                await reply(update, f"Error: {e}")
+                return
+            finally:
+                typing_task.cancel()
 
-        if result.get("session_id"):
-            sessions[chat_id] = result["session_id"]
-        if result.get("cwd"):
-            working_dirs[chat_id] = result["cwd"]
-        _save_state()
+            if result.get("session_id"):
+                sessions[chat_id] = result["session_id"]
+            if result.get("cwd"):
+                working_dirs[chat_id] = result["cwd"]
+            _save_state()
 
-        _record(chat_id, "user", caption or "[file]")
-        _record(chat_id, "bot", result["text"] or "(empty)")
+            _record(chat_id, "user", caption or "[file]")
+            _record(chat_id, "bot", result["text"] or "(empty)")
 
-        await _send_message(update, result["text"])
-        if _bot_ref:
-            asyncio.create_task(_check_usage_thresholds(_bot_ref))
+            await _send_message(update, result["text"])
+            if _bot_ref:
+                asyncio.create_task(_check_usage_thresholds(_bot_ref))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _transcribe_voice(ogg_path: str) -> str:
@@ -959,55 +987,58 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_obj = await voice.get_file()
     tmp_dir = tempfile.mkdtemp(prefix="tg_claude_")
-    ogg_path = os.path.join(tmp_dir, "voice.ogg")
-    await file_obj.download_to_drive(ogg_path)
+    try:
+        ogg_path = os.path.join(tmp_dir, "voice.ogg")
+        await file_obj.download_to_drive(ogg_path)
 
-    loop = asyncio.get_event_loop()
-    text = await loop.run_in_executor(None, _transcribe_voice, ogg_path)
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(None, _transcribe_voice, ogg_path)
 
-    if not text:
-        await reply(update, "Could not transcribe voice message.")
-        return
-
-    # Show what was transcribed
-    c = COLORS
-    print(f"\n{c['cyan']}{c['bold']}You (voice):{c['reset']} {text}", flush=True)
-    await update.message.reply_text(f"Transcribed: {text}")
-
-    lock = _get_lock(chat_id)
-    if lock.locked():
-        await update.message.reply_text("Queued — waiting for current task to finish...")
-
-    async with lock:
-        session_id = sessions.get(chat_id)
-        cwd = working_dirs.get(chat_id, DEFAULT_CWD)
-        model = models.get(chat_id)
-
-        typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
-
-        try:
-            result = await loop.run_in_executor(
-                None, lambda: run_claude(text, session_id, cwd, model, chat_id=chat_id)
-            )
-        except Exception as e:
-            print(f">>> ERROR: {e}", flush=True)
-            await reply(update, f"Error: {e}")
+        if not text:
+            await reply(update, "Could not transcribe voice message.")
             return
-        finally:
-            typing_task.cancel()
 
-        if result.get("session_id"):
-            sessions[chat_id] = result["session_id"]
-        if result.get("cwd"):
-            working_dirs[chat_id] = result["cwd"]
-        _save_state()
+        # Show what was transcribed
+        c = COLORS
+        print(f"\n{c['cyan']}{c['bold']}You (voice):{c['reset']} {text}", flush=True)
+        await update.message.reply_text(f"Transcribed: {text}")
 
-        _record(chat_id, "user", f"[voice] {text}")
-        _record(chat_id, "bot", result["text"] or "(empty)")
+        lock = _get_lock(chat_id)
+        if lock.locked():
+            await update.message.reply_text("Queued — waiting for current task to finish...")
 
-        await _send_message(update, result["text"])
-        if _bot_ref:
-            asyncio.create_task(_check_usage_thresholds(_bot_ref))
+        async with lock:
+            session_id = sessions.get(chat_id)
+            cwd = working_dirs.get(chat_id, DEFAULT_CWD)
+            model = models.get(chat_id)
+
+            typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
+
+            try:
+                result = await loop.run_in_executor(
+                    None, lambda: run_claude(text, session_id, cwd, model, chat_id=chat_id)
+                )
+            except Exception as e:
+                print(f">>> ERROR: {e}", flush=True)
+                await reply(update, f"Error: {e}")
+                return
+            finally:
+                typing_task.cancel()
+
+            if result.get("session_id"):
+                sessions[chat_id] = result["session_id"]
+            if result.get("cwd"):
+                working_dirs[chat_id] = result["cwd"]
+            _save_state()
+
+            _record(chat_id, "user", f"[voice] {text}")
+            _record(chat_id, "bot", result["text"] or "(empty)")
+
+            await _send_message(update, result["text"])
+            if _bot_ref:
+                asyncio.create_task(_check_usage_thresholds(_bot_ref))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ── Main ────────────────────────────────────────────────────────
