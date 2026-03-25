@@ -16,6 +16,23 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 load_dotenv()
 
+VERSION = "0.3.0"
+
+
+def _git_hash() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return "dev"
+
+
+BUILD_ID = _git_hash()
+BUILD_TIME = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USER_ID = int(os.environ["TELEGRAM_USER_ID"])
 
@@ -46,6 +63,7 @@ def _save_state():
         "sessions": {str(k): v for k, v in sessions.items()},
         "working_dirs": {str(k): v for k, v in working_dirs.items()},
         "models": {str(k): v for k, v in models.items()},
+        "history": {str(k): v for k, v in _history.items()},
     }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -59,7 +77,8 @@ models: dict[int, str] = {int(k): v for k, v in _state.get("models", {}).items()
 MAX_MSG_LEN = 4096
 MAX_HISTORY = 20  # per chat
 _chat_locks: dict[int, asyncio.Lock] = {}  # per-chat concurrency locks
-_history: dict[int, list] = {}  # chat_id -> list of {"role", "text", "ts"}
+_active_procs: dict[int, subprocess.Popen] = {}  # chat_id -> running claude process
+_history: dict[int, list] = {int(k): v for k, v in _state.get("history", {}).items()}
 
 
 def _get_lock(chat_id: int) -> asyncio.Lock:
@@ -247,13 +266,16 @@ MAX_RETRIES = 2
 RETRY_DELAY = 3  # seconds
 
 
-def _run_claude_once(cmd: list, cwd: str) -> dict:
+def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None) -> dict:
     """Execute claude CLI once, return parsed result dict."""
     c = COLORS
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, cwd=cwd, bufsize=1, encoding="utf-8", errors="replace",
     )
+
+    if chat_id is not None:
+        _active_procs[chat_id] = proc
 
     result_data = None
     detected_cwd = None
@@ -281,6 +303,11 @@ def _run_claude_once(cmd: list, cwd: str) -> dict:
     except subprocess.TimeoutExpired:
         proc.kill()
         return {"text": "Claude timed out.", "session_id": None, "cwd": cwd, "_timeout": True}
+    finally:
+        _active_procs.pop(chat_id, None)
+
+    if proc.returncode == -9 or proc.returncode == -15:
+        return {"text": "Cancelled.", "session_id": None, "cwd": cwd, "_cancelled": True}
 
     if result_data:
         return {
@@ -293,7 +320,8 @@ def _run_claude_once(cmd: list, cwd: str) -> dict:
 
 
 def run_claude(prompt: str, session_id: str | None = None,
-               cwd: str | None = None, model: str | None = None) -> dict:
+               cwd: str | None = None, model: str | None = None,
+               chat_id: int | None = None) -> dict:
     import time
     cwd = cwd or DEFAULT_CWD
     cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
@@ -310,10 +338,14 @@ def run_claude(prompt: str, session_id: str | None = None,
     sys.stdout.flush()
 
     for attempt in range(1, MAX_RETRIES + 2):  # 1 try + MAX_RETRIES retries
-        result = _run_claude_once(cmd, cwd)
+        result = _run_claude_once(cmd, cwd, chat_id)
 
         if result.get("_timeout"):
             result.pop("_timeout")
+            return result
+
+        if result.get("_cancelled"):
+            result.pop("_cancelled")
             return result
 
         if result.get("_failed") and attempt <= MAX_RETRIES:
@@ -382,7 +414,7 @@ def _time_until(iso_ts: str) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
-    await reply(update, "Claude Code bridge active. Type /help for commands.")
+    await reply(update, f"Claude Code bridge v{VERSION} · {BUILD_ID}\nType /help for commands.")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -407,7 +439,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/usage - plan usage & rate limits\n"
         "/status - version & account info\n"
         "/doctor - health check\n"
-        "/history - recent exchanges\n\n"
+        "/history - recent exchanges\n"
+        "/cancel - stop running task\n"
+        "/version - show bot version\n\n"
         "Skills (forwarded to Claude):\n"
         "/review /security_review /simplify\n"
         "/pr_comments /release_notes /init\n"
@@ -550,7 +584,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     await reply(update,
-        f"Claude Code version: {ver}\n"
+        f"Bot: v{VERSION} · {BUILD_ID}\n"
+        f"Built: {BUILD_TIME}\n"
+        f"Claude CLI: {ver}\n"
         f"Model: {models.get(chat_id, 'default')}\n"
         f"Directory: {working_dirs.get(chat_id, DEFAULT_CWD)}\n"
         f"Session: {sessions.get(chat_id, 'none')}"
@@ -587,6 +623,24 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, "\n".join(lines))
 
 
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    proc = _active_procs.get(chat_id)
+    if proc and proc.poll() is None:
+        proc.terminate()
+        await reply(update, "Cancelled running task.")
+    else:
+        await reply(update, "Nothing running.")
+
+
+async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update):
+        return
+    await reply(update, f"v{VERSION} · {BUILD_ID}")
+
+
 # ── Message handler (forwarding to Claude CLI) ─────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -598,8 +652,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+    lock = _get_lock(chat_id)
 
-    async with _get_lock(chat_id):
+    if lock.locked():
+        await update.message.reply_text("Queued — waiting for current task to finish...")
+
+    async with lock:
         session_id = sessions.get(chat_id)
         cwd = working_dirs.get(chat_id, DEFAULT_CWD)
         model = models.get(chat_id)
@@ -608,7 +666,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         loop = asyncio.get_event_loop()
         try:
-            result = await loop.run_in_executor(None, run_claude, text, session_id, cwd, model)
+            result = await loop.run_in_executor(
+                None, lambda: run_claude(text, session_id, cwd, model, chat_id=chat_id)
+            )
         except subprocess.TimeoutExpired:
             await reply(update, "Claude timed out (10 min limit).")
             return
@@ -663,7 +723,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         prompt += "\n\nPlease analyze this file."
 
-    async with _get_lock(chat_id):
+    lock = _get_lock(chat_id)
+    if lock.locked():
+        await update.message.reply_text("Queued — waiting for current task to finish...")
+
+    async with lock:
         session_id = sessions.get(chat_id)
         cwd = working_dirs.get(chat_id, DEFAULT_CWD)
         model = models.get(chat_id)
@@ -672,7 +736,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         loop = asyncio.get_event_loop()
         try:
-            result = await loop.run_in_executor(None, run_claude, prompt, session_id, cwd, model)
+            result = await loop.run_in_executor(
+                None, lambda: run_claude(prompt, session_id, cwd, model, chat_id=chat_id)
+            )
         except Exception as e:
             print(f">>> ERROR: {e}", flush=True)
             await reply(update, f"Error: {e}")
@@ -687,6 +753,87 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_state()
 
         _record(chat_id, "user", caption or "[file]")
+        _record(chat_id, "bot", result["text"] or "(empty)")
+
+        await _send_message(update, result["text"])
+
+
+def _transcribe_voice(ogg_path: str) -> str:
+    """Convert .ogg voice note to text via speech_recognition + pydub."""
+    import speech_recognition as sr
+    from pydub import AudioSegment
+
+    wav_path = ogg_path.rsplit(".", 1)[0] + ".wav"
+    audio = AudioSegment.from_ogg(ogg_path)
+    audio.export(wav_path, format="wav")
+
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(wav_path) as source:
+        audio_data = recognizer.record(source)
+    try:
+        return recognizer.recognize_google(audio_data)
+    except sr.UnknownValueError:
+        return ""
+    except sr.RequestError as e:
+        return f"[transcription failed: {e}]"
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages — transcribe and forward to Claude."""
+    if not await is_allowed(update):
+        return
+
+    chat_id = update.effective_chat.id
+    voice = update.message.voice
+    if not voice:
+        return
+
+    file_obj = await voice.get_file()
+    tmp_dir = tempfile.mkdtemp(prefix="tg_claude_")
+    ogg_path = os.path.join(tmp_dir, "voice.ogg")
+    await file_obj.download_to_drive(ogg_path)
+
+    loop = asyncio.get_event_loop()
+    text = await loop.run_in_executor(None, _transcribe_voice, ogg_path)
+
+    if not text:
+        await reply(update, "Could not transcribe voice message.")
+        return
+
+    # Show what was transcribed
+    c = COLORS
+    print(f"\n{c['cyan']}{c['bold']}You (voice):{c['reset']} {text}", flush=True)
+    await update.message.reply_text(f"Transcribed: {text}")
+
+    lock = _get_lock(chat_id)
+    if lock.locked():
+        await update.message.reply_text("Queued — waiting for current task to finish...")
+
+    async with lock:
+        session_id = sessions.get(chat_id)
+        cwd = working_dirs.get(chat_id, DEFAULT_CWD)
+        model = models.get(chat_id)
+
+        typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
+
+        try:
+            result = await loop.run_in_executor(
+                None, lambda: run_claude(text, session_id, cwd, model, chat_id=chat_id)
+            )
+        except Exception as e:
+            print(f">>> ERROR: {e}", flush=True)
+            await reply(update, f"Error: {e}")
+            return
+        finally:
+            typing_task.cancel()
+
+        if result.get("session_id"):
+            sessions[chat_id] = result["session_id"]
+        if result.get("cwd"):
+            working_dirs[chat_id] = result["cwd"]
+        _save_state()
+
+        _record(chat_id, "user", f"[voice] {text}")
         _record(chat_id, "bot", result["text"] or "(empty)")
 
         await _send_message(update, result["text"])
@@ -719,6 +866,8 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("doctor", cmd_doctor))
     app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("version", cmd_version))
 
     # Skills forwarded to CLI — registered as commands so Telegram
     # doesn't eat them; handler just forwards the text as-is
@@ -726,16 +875,84 @@ def main():
         safe = skill.replace("-", "_")
         app.add_handler(CommandHandler(safe, handle_message))
 
-    # Photos and documents
+    # Photos, documents, and voice
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_file))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     # Everything else (plain text + unknown /commands)
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
 
-    print(f"{COLORS['cyan']}Bot started. Listening for messages...{COLORS['reset']}")
+    print(f"{COLORS['cyan']}Bot v{VERSION} · {BUILD_ID} started. Listening for messages...{COLORS['reset']}")
     sys.stdout.flush()
     app.run_polling()
 
 
+def _run_with_auto_reload():
+    """Run the bot as a subprocess; restart on file change or crash."""
+    import time as _time
+    import signal
+    import threading
+
+    SCRIPT = os.path.abspath(__file__)
+    RESTART_DELAY = 3
+    c = COLORS
+    proc = None
+    file_changed = threading.Event()
+
+    def _watch():
+        """Poll bot.py mtime every 2s, signal when it changes."""
+        last_mtime = os.path.getmtime(SCRIPT)
+        while not file_changed.is_set():
+            _time.sleep(2)
+            try:
+                current = os.path.getmtime(SCRIPT)
+                if current != last_mtime:
+                    last_mtime = current
+                    print(f"\n{c['yellow']}{c['bold']}File changed detected — restarting...{c['reset']}", flush=True)
+                    file_changed.set()
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+            except OSError:
+                pass
+
+    watcher = threading.Thread(target=_watch, daemon=True)
+    watcher.start()
+
+    while True:
+        file_changed.clear()
+        print(f"{c['cyan']}Starting bot (pid will follow)...{c['reset']}", flush=True)
+
+        proc = subprocess.Popen(
+            [sys.executable, SCRIPT, "--run"],
+            stdout=None, stderr=None,  # inherit terminal
+        )
+
+        proc.wait()
+
+        if file_changed.is_set():
+            print(f"{c['cyan']}Reloading with updated code...{c['reset']}", flush=True)
+            _time.sleep(1)
+            continue
+
+        if proc.returncode == 0:
+            print(f"{c['yellow']}Bot exited cleanly.{c['reset']}")
+            break
+
+        print(f"{c['red']}{c['bold']}Bot exited with code {proc.returncode}{c['reset']}")
+        print(f"{c['yellow']}Restarting in {RESTART_DELAY}s...{c['reset']}", flush=True)
+        _time.sleep(RESTART_DELAY)
+
+
 if __name__ == "__main__":
-    main()
+    if "--run" in sys.argv:
+        # Actually run the bot (launched by the wrapper)
+        try:
+            main()
+        except KeyboardInterrupt:
+            pass
+    else:
+        # Wrapper with auto-reload
+        try:
+            _run_with_auto_reload()
+        except KeyboardInterrupt:
+            print(f"\n{COLORS['yellow']}Stopped by user.{COLORS['reset']}")
