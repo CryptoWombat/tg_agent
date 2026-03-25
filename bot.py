@@ -716,27 +716,25 @@ async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update,"Could not fetch usage data.")
         return
 
+    USAGE_BUCKETS = [
+        ("five_hour",       "5-hour session"),
+        ("seven_day",       "Weekly quota"),
+        ("seven_day_opus",  "Weekly Opus"),
+    ]
+
     lines = []
-    for key, label in [("five_hour", "5-hour session"), ("seven_day", "Weekly quota")]:
+    for key, label in USAGE_BUCKETS:
         bucket = data.get(key)
         if not bucket:
             continue
         pct = bucket.get("utilization", 0)
         resets_at = bucket.get("resets_at")
         bar = _progress_bar(pct)
-        reset_str = f"resets in {_time_until(resets_at)}" if resets_at else ""
-        lines.append(f"{label}\n{bar}  {pct:.0f}%  ({reset_str})")
-
-    opus = data.get("seven_day_opus")
-    if opus and opus.get("utilization", 0) > 0:
-        pct = opus["utilization"]
-        resets_at = opus.get("resets_at")
-        bar = _progress_bar(pct)
-        reset_str = f"resets in {_time_until(resets_at)}" if resets_at else ""
-        lines.append(f"Weekly Opus\n{bar}  {pct:.0f}%  ({reset_str})")
+        reset_str = f"  resets in {_time_until(resets_at)}" if resets_at else ""
+        lines.append(f"{label}\n{bar}  {pct:.0f}%{reset_str}")
 
     msg = "\n\n".join(lines) if lines else "No usage data available."
-    await reply(update,msg)
+    await reply(update, msg)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
