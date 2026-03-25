@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import NetworkError, Conflict, TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 load_dotenv()
@@ -1064,6 +1065,15 @@ def main():
         )
 
     app.post_init = _notify_startup
+
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Silently ignore transient network errors; log real ones."""
+        err = context.error
+        if isinstance(err, (NetworkError, Conflict, TimedOut)):
+            return  # transient — bot auto-retries
+        log.error("Unhandled exception: %s", err, exc_info=err)
+
+    app.add_error_handler(error_handler)
 
     print(f"{COLORS['cyan']}Bot v{VERSION} · {BUILD_ID} started. Listening for messages...{COLORS['reset']}")
     sys.stdout.flush()
