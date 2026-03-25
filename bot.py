@@ -31,7 +31,9 @@ def _git_hash() -> str:
 
 
 BUILD_ID = _git_hash()
-BUILD_TIME = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+BUILD_TIME = datetime.fromtimestamp(
+    os.path.getmtime(os.path.abspath(__file__)), tz=timezone.utc
+).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USER_ID = int(os.environ["TELEGRAM_USER_ID"])
@@ -139,7 +141,7 @@ async def _keep_typing(chat):
 def _escape_md2(text: str) -> str:
     """Escape special chars for Telegram MarkdownV2, preserving code blocks and inline code."""
     # Extract code blocks and inline code, escape everything else
-    SPECIAL = r'_*[]()~`>#+=|{}.!-'
+    SPECIAL = r'\_*[]()~`>#+=|{}.!-'
     parts = []
     pos = 0
     # Match ```...``` blocks and `...` inline code
@@ -147,6 +149,7 @@ def _escape_md2(text: str) -> str:
     for m in pattern.finditer(text):
         # Escape text before this code span
         before = text[pos:m.start()]
+        before = before.replace('\\', '\\\\')  # escape backslashes first
         for ch in SPECIAL:
             before = before.replace(ch, f'\\{ch}')
         parts.append(before)
@@ -162,6 +165,7 @@ def _escape_md2(text: str) -> str:
         pos = m.end()
     # Escape remaining text
     tail = text[pos:]
+    tail = tail.replace('\\', '\\\\')  # escape backslashes first
     for ch in SPECIAL:
         tail = tail.replace(ch, f'\\{ch}')
     parts.append(tail)
@@ -882,6 +886,14 @@ def main():
     # Everything else (plain text + unknown /commands)
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
 
+    async def _notify_startup(application):
+        await application.bot.send_message(
+            chat_id=ALLOWED_USER_ID,
+            text=f"Bot restarted — v{VERSION} · {BUILD_ID}\nLast changed: {BUILD_TIME}",
+        )
+
+    app.post_init = _notify_startup
+
     print(f"{COLORS['cyan']}Bot v{VERSION} · {BUILD_ID} started. Listening for messages...{COLORS['reset']}")
     sys.stdout.flush()
     app.run_polling()
@@ -890,25 +902,30 @@ def main():
 def _run_with_auto_reload():
     """Run the bot as a subprocess; restart on file change or crash."""
     import time as _time
-    import signal
     import threading
 
     SCRIPT = os.path.abspath(__file__)
     RESTART_DELAY = 3
+    COOLDOWN = 5  # seconds to ignore mtime changes after restart
     c = COLORS
     proc = None
     file_changed = threading.Event()
+    stop_watcher = threading.Event()
+    cooldown_until = [0.0]  # mutable container for thread access
 
     def _watch():
         """Poll bot.py mtime every 2s, signal when it changes."""
         last_mtime = os.path.getmtime(SCRIPT)
-        while not file_changed.is_set():
+        while not stop_watcher.is_set():
             _time.sleep(2)
+            if _time.time() < cooldown_until[0]:
+                last_mtime = os.path.getmtime(SCRIPT)
+                continue
             try:
                 current = os.path.getmtime(SCRIPT)
                 if current != last_mtime:
                     last_mtime = current
-                    print(f"\n{c['yellow']}{c['bold']}File changed detected — restarting...{c['reset']}", flush=True)
+                    print(f"\n{c['yellow']}{c['bold']}File change detected — restarting...{c['reset']}", flush=True)
                     file_changed.set()
                     if proc and proc.poll() is None:
                         proc.terminate()
@@ -920,6 +937,7 @@ def _run_with_auto_reload():
 
     while True:
         file_changed.clear()
+        cooldown_until[0] = _time.time() + COOLDOWN
         print(f"{c['cyan']}Starting bot (pid will follow)...{c['reset']}", flush=True)
 
         proc = subprocess.Popen(
