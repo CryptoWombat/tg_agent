@@ -81,6 +81,8 @@ MAX_HISTORY = 20  # per chat
 _chat_locks: dict[int, asyncio.Lock] = {}  # per-chat concurrency locks
 _active_procs: dict[int, subprocess.Popen] = {}  # chat_id -> running claude process
 _history: dict[int, list] = {int(k): v for k, v in _state.get("history", {}).items()}
+_last_usage_pct: dict[str, int] = {}  # bucket -> last reported 10% band
+_bot_ref = None  # set at startup for use in background tasks
 
 
 def _get_lock(chat_id: int) -> asyncio.Lock:
@@ -394,6 +396,43 @@ def _progress_bar(pct: float, width: int = 20) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+async def _check_usage_thresholds(bot):
+    """Fetch usage and notify if any quota crossed a new 10% band since last check."""
+    try:
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, _fetch_usage)
+        if not data:
+            return
+
+        alerts = []
+        bucket_labels = {
+            "five_hour": "5-hour session",
+            "seven_day": "Weekly quota",
+            "seven_day_opus": "Weekly Opus",
+        }
+
+        for key, label in bucket_labels.items():
+            bucket = data.get(key)
+            if not bucket:
+                continue
+            pct = bucket.get("utilization", 0)
+            band = int(pct // 10)
+            last_band = _last_usage_pct.get(key, -1)
+
+            if band > last_band:
+                _last_usage_pct[key] = band
+                resets_at = bucket.get("resets_at")
+                reset_str = f"  resets in {_time_until(resets_at)}" if resets_at else ""
+                bar = _progress_bar(pct)
+                alerts.append(f"{label}\n{bar}  {pct:.0f}%{reset_str}")
+
+        if alerts:
+            msg = "Usage update:\n\n" + "\n\n".join(alerts)
+            await bot.send_message(chat_id=ALLOWED_USER_ID, text=msg)
+    except Exception as e:
+        log.warning(f"Usage threshold check failed: {e}")
+
+
 def _time_until(iso_ts: str) -> str:
     target = datetime.fromisoformat(iso_ts)
     if target.tzinfo is None:
@@ -435,6 +474,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Navigation:\n"
         "/cd, /cwd - show working directory\n"
         "/cd <path> - change directory\n"
+        "/project - list projects\n"
+        "/project <name> - switch project\n"
         "/add_dir <path> - add extra directory\n\n"
         "Model:\n"
         "/model - show current model\n"
@@ -514,6 +555,67 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update,f"Not a directory: {target}")
 
 
+PROJECTS = {
+    "tg_agent":   r"C:\Users\w0mb4\tg_agent",
+    "quotebot":   r"C:\Users\w0mb4\QuoteBot",
+    "alphaforge": r"C:\Users\w0mb4\AlphaForge",
+}
+SUMMARIES_DIR = r"C:\Users\w0mb4\project-summaries"
+
+
+async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    args = " ".join(context.args).strip().lower() if context.args else ""
+
+    if not args:
+        current = working_dirs.get(chat_id, DEFAULT_CWD)
+        names = "\n".join(f"  {k} → {v}" for k, v in PROJECTS.items())
+        await reply(update, f"Current directory: {current}\n\nProjects:\n{names}")
+        return
+
+    target = PROJECTS.get(args)
+    if not target:
+        names = ", ".join(PROJECTS.keys())
+        await reply(update, f"Unknown project '{args}'. Available: {names}")
+        return
+
+    if not os.path.isdir(target):
+        await reply(update, f"Directory not found: {target}")
+        return
+
+    # Detect current project name from cwd
+    current_cwd = working_dirs.get(chat_id, DEFAULT_CWD)
+    current_project = next(
+        (k for k, v in PROJECTS.items() if os.path.normpath(v) == os.path.normpath(current_cwd)),
+        None
+    )
+
+    # Switch directory
+    working_dirs[chat_id] = target
+    _save_state()
+
+    msg = f"Switched to project: {args}\nDirectory: {target}"
+
+    # Load summary for new project if it exists
+    summary_path = os.path.join(SUMMARIES_DIR, f"{args}.md")
+    if os.path.exists(summary_path):
+        try:
+            with open(summary_path, encoding="utf-8") as f:
+                summary = f.read(1500)
+            msg += f"\n\nContext summary:\n{summary}"
+        except Exception:
+            pass
+    else:
+        msg += "\n\n(No saved summary for this project yet.)"
+
+    if current_project and current_project != args:
+        msg += f"\n\nTip: clear context when ready (/new clears Claude session)."
+
+    await reply(update, msg)
+
+
 async def cmd_add_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
@@ -528,18 +630,78 @@ async def cmd_add_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+MODEL_ALIASES = {
+    "opus": "claude-opus-4-6",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+
+# Ordered low → high for up/down switching
+MODEL_LADDER = [
+    ("haiku", "claude-haiku-4-5-20251001"),
+    ("sonnet", "claude-sonnet-4-6"),
+    ("opus", "claude-opus-4-6"),
+]
+
+DEFAULT_MODEL_ID = "claude-sonnet-4-6"
+
+
+def _model_name(model_id: str) -> str:
+    """Return a friendly name for a model ID."""
+    for name, mid in MODEL_LADDER:
+        if mid == model_id:
+            return f"{name.capitalize()} ({mid})"
+    return model_id
+
+
+def _ladder_index(model_id: str) -> int:
+    for i, (_, mid) in enumerate(MODEL_LADDER):
+        if mid == model_id:
+            return i
+    return -1
+
+
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
     chat_id = update.effective_chat.id
-    args = " ".join(context.args).strip() if context.args else ""
+    args = " ".join(context.args).strip().lower() if context.args else ""
+    current = models.get(chat_id, DEFAULT_MODEL_ID)
+
     if not args:
-        current = models.get(chat_id, "default (CLI decides)")
-        await reply(update,f"Current model: {current}")
+        await reply(update, f"Current model: {_model_name(current)}")
         return
-    models[chat_id] = args
+
+    if args == "up":
+        idx = _ladder_index(current)
+        if idx < 0:
+            idx = 0  # unknown model, start from bottom
+        if idx >= len(MODEL_LADDER) - 1:
+            await reply(update, f"Already on highest: {_model_name(current)}")
+            return
+        _, new_id = MODEL_LADDER[idx + 1]
+        models[chat_id] = new_id
+        _save_state()
+        await reply(update, f"Upgraded to: {_model_name(new_id)}")
+        return
+
+    if args == "down":
+        idx = _ladder_index(current)
+        if idx < 0:
+            idx = len(MODEL_LADDER) - 1  # unknown model, start from top
+        if idx <= 0:
+            await reply(update, f"Already on lowest: {_model_name(current)}")
+            return
+        _, new_id = MODEL_LADDER[idx - 1]
+        models[chat_id] = new_id
+        _save_state()
+        await reply(update, f"Downgraded to: {_model_name(new_id)}")
+        return
+
+    model_id = MODEL_ALIASES.get(args, args)
+    models[chat_id] = model_id
     _save_state()
-    await reply(update,f"Model set to: {args}")
+    await reply(update, f"Model set to: {_model_name(model_id)}")
 
 
 async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -694,6 +856,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Don't use reply() here — run_claude already printed to terminal
         await _send_message(update, result["text"])
+        if _bot_ref:
+            asyncio.create_task(_check_usage_thresholds(_bot_ref))
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -760,6 +924,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _record(chat_id, "bot", result["text"] or "(empty)")
 
         await _send_message(update, result["text"])
+        if _bot_ref:
+            asyncio.create_task(_check_usage_thresholds(_bot_ref))
 
 
 def _transcribe_voice(ogg_path: str) -> str:
@@ -841,6 +1007,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _record(chat_id, "bot", result["text"] or "(empty)")
 
         await _send_message(update, result["text"])
+        if _bot_ref:
+            asyncio.create_task(_check_usage_thresholds(_bot_ref))
 
 
 # ── Main ────────────────────────────────────────────────────────
@@ -860,6 +1028,7 @@ def main():
     # Navigation
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("cwd", cmd_cd))          # alias
+    app.add_handler(CommandHandler("project", cmd_project))
     app.add_handler(CommandHandler("add_dir", cmd_add_dir))
 
     # Model
@@ -887,6 +1056,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
 
     async def _notify_startup(application):
+        global _bot_ref
+        _bot_ref = application.bot
         await application.bot.send_message(
             chat_id=ALLOWED_USER_ID,
             text=f"Bot restarted — v{VERSION} · {BUILD_ID}\nLast changed: {BUILD_TIME}",
