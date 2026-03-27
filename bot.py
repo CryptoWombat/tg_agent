@@ -1071,8 +1071,15 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not args:
         current = working_dirs.get(chat_id, DEFAULT_CWD)
-        names = "\n".join(f"  {k} → {v}" for k, v in PROJECTS.items())
-        await reply(update, f"Current directory: {current}\n\nProjects:\n{names}")
+        current_name = next(
+            (k for k, v in PROJECTS.items() if os.path.normpath(v) == os.path.normpath(current)),
+            None
+        )
+        if current_name:
+            await reply(update, f"Project: {current_name}\nDirectory: {current}")
+        else:
+            names = "\n".join(f"  {k} → {v}" for k, v in PROJECTS.items())
+            await reply(update, f"No active project (cwd: {current})\n\nAvailable:\n{names}")
         return
 
     target = PROJECTS.get(args)
