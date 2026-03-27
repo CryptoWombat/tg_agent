@@ -2,3 +2,5 @@
 state.json
 __pycache__/
 *.pyc
+.deploy-lock
+.codex-home/

@@ -1,9 +1,12 @@
 import asyncio
+import base64
 import json
 import logging
 import os
+import queue
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,7 +22,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 load_dotenv()
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 def _git_hash() -> str:
@@ -39,7 +42,8 @@ BUILD_TIME = datetime.fromtimestamp(
 ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ALLOWED_USER_ID = int(os.environ["TELEGRAM_USER_ID"])
+OWNER_USER_ID = int(os.environ["TELEGRAM_USER_ID"])
+ALLOWED_USER_IDS = {OWNER_USER_ID, 517263385}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -53,6 +57,8 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 DEFAULT_CWD = os.path.expanduser("~")
 DEFAULT_MODEL = None  # use CLI default
+DEFAULT_PROVIDER = "claude"
+SUPPORTED_PROVIDERS = {"claude", "codex"}
 
 
 def _load_state() -> dict:
@@ -65,10 +71,16 @@ def _load_state() -> dict:
 
 def _save_state():
     data = {
-        "sessions": {str(k): v for k, v in sessions.items()},
+        "provider": {str(k): v for k, v in providers.items()},
+        "sessions": {
+            str(chat_id): values for chat_id, values in provider_sessions.items()
+        },
         "working_dirs": {str(k): v for k, v in working_dirs.items()},
-        "models": {str(k): v for k, v in models.items()},
+        "models": {
+            str(chat_id): values for chat_id, values in provider_models.items()
+        },
         "history": {str(k): v for k, v in _history.items()},
+        "show_tools": {str(k): v for k, v in _show_tools.items()},
     }
     tmp = STATE_FILE + ".tmp"
     with _state_lock:
@@ -79,9 +91,29 @@ def _save_state():
 
 
 _state = _load_state()
-sessions: dict[int, str] = {int(k): v for k, v in _state.get("sessions", {}).items()}
+providers: dict[int, str] = {
+    int(k): v for k, v in _state.get("provider", {}).items() if v in SUPPORTED_PROVIDERS
+}
+provider_sessions: dict[int, dict[str, str]] = {
+    int(k): {pk: pv for pk, pv in v.items() if pk in SUPPORTED_PROVIDERS}
+    for k, v in _state.get("sessions", {}).items()
+    if isinstance(v, dict)
+}
+provider_models: dict[int, dict[str, str]] = {
+    int(k): {pk: pv for pk, pv in v.items() if pk in SUPPORTED_PROVIDERS}
+    for k, v in _state.get("models", {}).items()
+    if isinstance(v, dict)
+}
+
+# Backward compatibility with older flat Claude-only state.
+for chat_id, session_id in _state.get("sessions", {}).items():
+    if isinstance(session_id, str):
+        provider_sessions.setdefault(int(chat_id), {})["claude"] = session_id
+for chat_id, model_id in _state.get("models", {}).items():
+    if isinstance(model_id, str):
+        provider_models.setdefault(int(chat_id), {})["claude"] = model_id
+
 working_dirs: dict[int, str] = {int(k): v for k, v in _state.get("working_dirs", {}).items()}
-models: dict[int, str] = {int(k): v for k, v in _state.get("models", {}).items()}
 
 MAX_MSG_LEN = 4096
 MAX_HISTORY = 20  # per chat
@@ -89,10 +121,51 @@ _SESSION_ID_RE = re.compile(r'^[a-zA-Z0-9_-]{8,200}$')
 _chat_locks: dict[int, asyncio.Lock] = {}  # per-chat concurrency locks
 _active_procs: dict[int, subprocess.Popen] = {}  # chat_id -> running claude process
 _history: dict[int, list] = {int(k): v for k, v in _state.get("history", {}).items()}
+_show_tools: dict[int, bool] = {int(k): v for k, v in _state.get("show_tools", {}).items()}
 _last_usage_pct: dict[str, int] = {}  # bucket -> last reported 10% band
 _state_lock = threading.Lock()          # protects _save_state writes
 _active_procs_lock = threading.Lock()   # protects _active_procs dict
 _bot_ref = None  # set at startup for use in background tasks
+
+
+def _cli_bin(name: str) -> str:
+    if os.name == "nt":
+        return f"{name}.cmd" if name == "codex" else f"{name}.exe" if shutil.which(f"{name}.exe") else name
+    return name
+
+
+def _get_provider(chat_id: int) -> str:
+    return providers.get(chat_id, DEFAULT_PROVIDER)
+
+
+def _get_session(chat_id: int, provider: str | None = None) -> str | None:
+    provider = provider or _get_provider(chat_id)
+    return provider_sessions.get(chat_id, {}).get(provider)
+
+
+def _set_session(chat_id: int, provider: str, session_id: str | None):
+    provider_sessions.setdefault(chat_id, {})
+    if session_id:
+        provider_sessions[chat_id][provider] = session_id
+    else:
+        provider_sessions[chat_id].pop(provider, None)
+        if not provider_sessions[chat_id]:
+            provider_sessions.pop(chat_id, None)
+
+
+def _get_model(chat_id: int, provider: str | None = None) -> str | None:
+    provider = provider or _get_provider(chat_id)
+    return provider_models.get(chat_id, {}).get(provider)
+
+
+def _set_model(chat_id: int, provider: str, model_id: str | None):
+    provider_models.setdefault(chat_id, {})
+    if model_id:
+        provider_models[chat_id][provider] = model_id
+    else:
+        provider_models[chat_id].pop(provider, None)
+        if not provider_models[chat_id]:
+            provider_models.pop(chat_id, None)
 
 
 def _get_lock(chat_id: int) -> asyncio.Lock:
@@ -134,7 +207,7 @@ CLI_SKILLS = {
 # ── Helpers ─────────────────────────────────────────────────────
 
 async def is_allowed(update: Update) -> bool:
-    if update.effective_user.id != ALLOWED_USER_ID:
+    if update.effective_user.id not in ALLOWED_USER_IDS:
         await update.message.reply_text("Unauthorized.")
         return False
     return True
@@ -196,6 +269,50 @@ async def _send_message(update: Update, text: str):
             )
         except Exception:
             await update.message.reply_text(chunk)
+
+
+async def _send_to_chat(bot, chat_id: int, text: str):
+    """Send a message to a chat_id, with MarkdownV2 formatting and chunking."""
+    if not text:
+        return
+    for i in range(0, len(text), MAX_MSG_LEN):
+        chunk = text[i : i + MAX_MSG_LEN]
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=_escape_md2(chunk),
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        except Exception:
+            try:
+                await bot.send_message(chat_id=chat_id, text=chunk)
+            except Exception:
+                pass
+
+
+async def _stream_consumer(chat_id: int, stream_queue: queue.Queue, bot, show_tools: bool):
+    """Drain stream_queue and send messages to Telegram. Runs until 'done' sentinel."""
+    streamed_any = False
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            item = await loop.run_in_executor(None, lambda: stream_queue.get(timeout=1.0))
+        except queue.Empty:
+            continue
+
+        etype = item[0]
+        if etype == "done":
+            return streamed_any
+
+        if etype == "text":
+            text = item[1]
+            if text.strip():
+                streamed_any = True
+                await _send_to_chat(bot, chat_id, text)
+        elif etype in ("tool", "tool_result") and show_tools:
+            await _send_to_chat(bot, chat_id, item[1])
+
+    return streamed_any
 
 
 async def reply(update: Update, text: str):
@@ -282,7 +399,25 @@ MAX_RETRIES = 2
 RETRY_DELAY = 3  # seconds
 
 
-def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None) -> dict:
+def _format_tool_event(block: dict) -> str:
+    """Format a tool_use block into a human-readable string."""
+    tool = block.get("name", "?")
+    inp = block.get("input", {})
+    if tool == "Bash" and "command" in inp:
+        return f"Tool: {tool}\n$ {inp['command']}"
+    elif tool in ("Read", "Edit", "Write") and "file_path" in inp:
+        return f"Tool: {tool} — {inp['file_path']}"
+    elif tool in ("Grep", "Glob") and "pattern" in inp:
+        return f"Tool: {tool} — {inp['pattern']}"
+    else:
+        summary = json.dumps(inp, ensure_ascii=False)
+        if len(summary) > 200:
+            summary = summary[:200] + "..."
+        return f"Tool: {tool}\n{summary}"
+
+
+def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None,
+                     stream_queue: queue.Queue | None = None) -> dict:
     """Execute claude CLI once, return parsed result dict."""
     c = COLORS
     proc = subprocess.Popen(
@@ -296,6 +431,7 @@ def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None) -> dict:
 
     result_data = None
     detected_cwd = None
+    cancelled = False
     try:
         while True:
             line = proc.stdout.readline()
@@ -314,6 +450,24 @@ def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None) -> dict:
                     sys.stdout.flush()
                 if event.get("type") == "result":
                     result_data = event
+                # Push events to stream queue for Telegram delivery
+                if stream_queue is not None:
+                    etype = event.get("type", "")
+                    if etype == "assistant":
+                        for block in event.get("message", {}).get("content", []):
+                            if block.get("type") == "text":
+                                stream_queue.put(("text", block["text"]))
+                            elif block.get("type") == "tool_use":
+                                stream_queue.put(("tool", _format_tool_event(block)))
+                    elif etype == "tool_result":
+                        content = event.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(
+                                b.get("text", "") for b in content if b.get("type") == "text"
+                            )
+                        if content:
+                            preview = content[:300] + ("..." if len(content) > 300 else "")
+                            stream_queue.put(("tool_result", f"→ {preview}"))
             except json.JSONDecodeError:
                 pass
         proc.wait(timeout=600)
@@ -324,8 +478,12 @@ def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None) -> dict:
         with _active_procs_lock:
             _active_procs.pop(chat_id, None)
 
-    if proc.returncode == -9 or proc.returncode == -15:
-        return {"text": "Cancelled.", "session_id": None, "cwd": cwd, "_cancelled": True}
+    # Detect cancellation: on Unix -9 (SIGKILL) or -15 (SIGTERM),
+    # on Windows returncode 1 when no result was produced
+    rc = proc.returncode
+    if result_data is None and rc is not None and rc != 0:
+        if rc in (-9, -15) or (os.name == "nt" and rc == 1):
+            return {"text": "Cancelled.", "session_id": None, "cwd": cwd, "_cancelled": True}
 
     if result_data:
         return {
@@ -337,9 +495,67 @@ def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None) -> dict:
     return {"text": "", "session_id": None, "cwd": cwd, "_failed": True}
 
 
+def _run_codex_once(cmd: list, cwd: str, output_path: str, chat_id: int | None = None) -> dict:
+    """Execute Codex CLI once, return parsed result dict."""
+    c = COLORS
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=cwd,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    if chat_id is not None:
+        with _active_procs_lock:
+            _active_procs[chat_id] = proc
+
+    try:
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            line = line.rstrip()
+            if not line:
+                continue
+            print(f"{c['green']}Codex:{c['reset']} {line}")
+            sys.stdout.flush()
+        proc.wait(timeout=600)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return {"text": "Codex timed out.", "session_id": None, "cwd": cwd, "_timeout": True}
+    finally:
+        with _active_procs_lock:
+            _active_procs.pop(chat_id, None)
+
+    if proc.returncode == -9 or proc.returncode == -15:
+        return {"text": "Cancelled.", "session_id": None, "cwd": cwd, "_cancelled": True}
+
+    text = ""
+    if os.path.exists(output_path):
+        try:
+            with open(output_path, encoding="utf-8") as f:
+                text = f.read().strip()
+        except Exception:
+            text = ""
+
+    if proc.returncode != 0 and not text:
+        return {"text": "", "session_id": None, "cwd": cwd, "_failed": True}
+
+    return {
+        "text": text,
+        "session_id": "last",
+        "cwd": cwd,
+    }
+
+
 def run_claude(prompt: str, session_id: str | None = None,
                cwd: str | None = None, model: str | None = None,
-               chat_id: int | None = None) -> dict:
+               chat_id: int | None = None,
+               stream_queue: queue.Queue | None = None) -> dict:
     import time
     cwd = cwd or DEFAULT_CWD
     cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
@@ -355,29 +571,110 @@ def run_claude(prompt: str, session_id: str | None = None,
     print(f"{c['dim']}  cwd: {cwd}{c['reset']}")
     sys.stdout.flush()
 
-    for attempt in range(1, MAX_RETRIES + 2):  # 1 try + MAX_RETRIES retries
-        result = _run_claude_once(cmd, cwd, chat_id)
+    try:
+        for attempt in range(1, MAX_RETRIES + 2):  # 1 try + MAX_RETRIES retries
+            result = _run_claude_once(cmd, cwd, chat_id, stream_queue=stream_queue)
 
-        if result.get("_timeout"):
-            result.pop("_timeout")
+            if result.get("_timeout"):
+                result.pop("_timeout")
+                return result
+
+            if result.get("_cancelled"):
+                result.pop("_cancelled")
+                return result
+
+            if result.get("_failed") and attempt <= MAX_RETRIES:
+                # If resuming a session failed, drop --resume and start fresh
+                if session_id and "--resume" in cmd:
+                    print(f"  {c['yellow']}Session resume failed — starting fresh session...{c['reset']}")
+                    cmd = [a for a in cmd if a != "--resume" and a != session_id]
+                    session_id = None
+                print(f"  {c['yellow']}Retry {attempt}/{MAX_RETRIES}...{c['reset']}")
+                sys.stdout.flush()
+                time.sleep(RETRY_DELAY)
+                continue
+
+            result.pop("_failed", None)
+            if not result["text"]:
+                result["text"] = "No response from Claude."
             return result
 
-        if result.get("_cancelled"):
-            result.pop("_cancelled")
+        return {"text": "No response from Claude after retries.", "session_id": None, "cwd": cwd}
+    finally:
+        if stream_queue is not None:
+            stream_queue.put(("done", ""))
+
+
+def run_codex(prompt: str, session_id: str | None = None,
+              cwd: str | None = None, model: str | None = None,
+              chat_id: int | None = None) -> dict:
+    import time
+
+    cwd = cwd or DEFAULT_CWD
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as out:
+        output_path = out.name
+
+    cmd = [
+        _cli_bin("codex"),
+        "exec",
+        "--skip-git-repo-check",
+        "--full-auto",
+        "-C", cwd,
+        "-o", output_path,
+    ]
+    if model:
+        cmd.extend(["-m", model])
+    if session_id:
+        cmd.append("resume")
+        if session_id == "last":
+            cmd.append("--last")
+        else:
+            cmd.append(session_id)
+    cmd.append(prompt)
+
+    c = COLORS
+    print(f"\n{c['cyan']}{c['bold']}You:{c['reset']} {prompt}")
+    print(f"{c['dim']}  provider: codex  cwd: {cwd}{c['reset']}")
+    sys.stdout.flush()
+
+    try:
+        for attempt in range(1, MAX_RETRIES + 2):
+            result = _run_codex_once(cmd, cwd, output_path, chat_id)
+
+            if result.get("_timeout"):
+                result.pop("_timeout")
+                return result
+
+            if result.get("_cancelled"):
+                result.pop("_cancelled")
+                return result
+
+            if result.get("_failed") and attempt <= MAX_RETRIES:
+                print(f"  {c['yellow']}Retry {attempt}/{MAX_RETRIES}...{c['reset']}")
+                sys.stdout.flush()
+                time.sleep(RETRY_DELAY)
+                continue
+
+            result.pop("_failed", None)
+            if not result["text"]:
+                result["text"] = "No response from Codex."
             return result
+    finally:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
 
-        if result.get("_failed") and attempt <= MAX_RETRIES:
-            print(f"  {c['yellow']}Retry {attempt}/{MAX_RETRIES}...{c['reset']}")
-            sys.stdout.flush()
-            time.sleep(RETRY_DELAY)
-            continue
+    return {"text": "No response from Codex after retries.", "session_id": None, "cwd": cwd}
 
-        result.pop("_failed", None)
-        if not result["text"]:
-            result["text"] = "No response from Claude."
-        return result
 
-    return {"text": "No response from Claude after retries.", "session_id": None, "cwd": cwd}
+def run_agent(provider: str, prompt: str, session_id: str | None = None,
+              cwd: str | None = None, model: str | None = None,
+              chat_id: int | None = None,
+              stream_queue: queue.Queue | None = None) -> dict:
+    if provider == "codex":
+        return run_codex(prompt, session_id, cwd, model, chat_id)
+    return run_claude(prompt, session_id, cwd, model, chat_id, stream_queue=stream_queue)
 
 
 # ── Usage API ───────────────────────────────────────────────────
@@ -406,6 +703,182 @@ def _fetch_usage() -> dict | None:
 def _progress_bar(pct: float, width: int = 20) -> str:
     filled = round(width * pct / 100)
     return "█" * filled + "░" * (width - filled)
+
+
+def _short_path(path: str) -> str:
+    home = os.path.expanduser("~")
+    norm_path = os.path.normpath(path)
+    norm_home = os.path.normpath(home)
+    if norm_path == norm_home:
+        return "~"
+    prefix = norm_home + os.sep
+    if norm_path.startswith(prefix):
+        return "~" + os.sep + norm_path[len(prefix):]
+    return path
+
+
+def _run_cli_capture(cmd: list[str], timeout: int = 10) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return False, str(e)
+
+    output = "\n".join(part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip()).strip()
+    return proc.returncode == 0, output
+
+
+def _extract_codex_account(login_output: str) -> str | None:
+    if not login_output:
+        return None
+    m = re.search(r"[\w.+-]+@[\w.-]+\.\w+", login_output)
+    if m:
+        return m.group(0)
+    m = re.search(r"logged in(?: as)?[: ]+(.+)", login_output, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _display_codex_version(version_output: str) -> str:
+    if not version_output:
+        return "OpenAI Codex"
+    line = version_output.splitlines()[0].strip()
+    m = re.search(r"(\d+\.\d+\.\d+)", line)
+    if m:
+        return f"OpenAI Codex (v{m.group(1)})"
+    if line.lower().startswith("codex"):
+        return "OpenAI " + line[0].upper() + line[1:]
+    return line
+
+
+def _decode_jwt_payload(token: str | None) -> dict:
+    if not token or token.count(".") < 2:
+        return {}
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        raw = base64.urlsafe_b64decode(payload.encode("ascii"))
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _load_codex_auth_profile() -> dict:
+    path = os.path.join(os.path.expanduser("~"), ".codex", "auth.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            auth = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+    tokens = auth.get("tokens", {})
+    access_payload = _decode_jwt_payload(tokens.get("access_token"))
+    id_payload = _decode_jwt_payload(tokens.get("id_token"))
+    api_auth = access_payload.get("https://api.openai.com/auth", {})
+    profile = access_payload.get("https://api.openai.com/profile", {})
+
+    email = profile.get("email") or id_payload.get("email")
+    plan = api_auth.get("chatgpt_plan_type")
+    if isinstance(plan, str):
+        plan = plan.capitalize()
+
+    return {
+        "email": email,
+        "plan": plan,
+    }
+
+
+def _load_latest_codex_thread() -> dict:
+    path = os.path.join(os.path.expanduser("~"), ".codex", "state_5.sqlite")
+    try:
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, cwd, sandbox_policy, approval_mode, cli_version, model, reasoning_effort "
+            "FROM threads ORDER BY updated_at DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        conn.close()
+    except sqlite3.Error:
+        return {}
+
+    return dict(row) if row else {}
+
+
+def _codex_permissions_label(thread: dict) -> str:
+    approval = thread.get("approval_mode")
+    policy_raw = thread.get("sandbox_policy")
+    try:
+        policy = json.loads(policy_raw) if policy_raw else {}
+    except json.JSONDecodeError:
+        policy = {}
+
+    sandbox_type = policy.get("type")
+    if approval == "never" and sandbox_type == "workspace-write":
+        return "Full auto"
+    if approval == "on-request" and sandbox_type == "workspace-write":
+        return "Default"
+    if approval and sandbox_type:
+        return f"{sandbox_type} / {approval}"
+    return "unknown"
+
+
+def _pad_status(label: str, value: str) -> str:
+    return f"{label:<19}{value}"
+
+
+def _format_codex_usage(chat_id: int) -> str:
+    cwd = working_dirs.get(chat_id, DEFAULT_CWD)
+    model = _get_model(chat_id, "codex") or "default"
+    session = _get_session(chat_id, "codex") or "none"
+    thread = _load_latest_codex_thread()
+    profile = _load_codex_auth_profile()
+
+    ver_ok, ver_output = _run_cli_capture([_cli_bin("codex"), "--version"], timeout=5)
+    login_ok, login_output = _run_cli_capture([_cli_bin("codex"), "login", "status"], timeout=8)
+
+    version = _display_codex_version(ver_output or thread.get("cli_version", ""))
+    if not ver_ok and not ver_output:
+        version = "OpenAI Codex"
+
+    if thread.get("cwd"):
+        cwd = thread["cwd"]
+    if thread.get("model"):
+        model = thread["model"]
+    if thread.get("id"):
+        session = thread["id"]
+
+    account = profile.get("email") or (_extract_codex_account(login_output) if login_ok else None)
+    if account and profile.get("plan"):
+        account = f"{account} ({profile['plan']})"
+    if not account:
+        account = "unavailable"
+
+    auth_ok = "OK" if login_ok else "Unavailable"
+    collab_mode = "Default" if _codex_permissions_label(thread) == "Default" else "Bot bridge"
+
+    lines = [
+        f">_ {version}",
+        "",
+        "Visit https://chatgpt.com/codex/settings/usage for up-to-date",
+        "information on rate limits and credits",
+        "",
+        _pad_status("Model:", f"{model} (reasoning none, summaries auto)"),
+        _pad_status("Directory:", _short_path(cwd)),
+        _pad_status("Permissions:", _codex_permissions_label(thread)),
+        _pad_status("Agents.md:", "<none>"),
+        _pad_status("Account:", account),
+        _pad_status("Collaboration mode:", collab_mode),
+        _pad_status("Session:", session),
+        "",
+        _pad_status("Context window:", "not captured by bot runtime"),
+        _pad_status("5h limit:", "not captured by bot runtime"),
+        _pad_status("Weekly limit:", "not captured by bot runtime"),
+        "",
+        _pad_status("Auth:", auth_ok),
+    ]
+    return "```text\n" + "\n".join(lines) + "\n```"
 
 
 async def _check_usage_thresholds(bot):
@@ -437,7 +910,7 @@ async def _check_usage_thresholds(bot):
 
         if alerts:
             msg = "Usage update:\n\n" + "\n\n".join(alerts)
-            await bot.send_message(chat_id=ALLOWED_USER_ID, text=msg)
+            await bot.send_message(chat_id=OWNER_USER_ID, text=msg)
     except Exception as e:
         log.warning(f"Usage threshold check failed: {e}")
 
@@ -469,7 +942,7 @@ def _time_until(iso_ts: str) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
-    await reply(update, f"Claude Code bridge v{VERSION} · {BUILD_ID}\nType /help for commands.")
+    await reply(update, f"Code CLI bridge v{VERSION} · {BUILD_ID}\nType /help for commands.")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -489,17 +962,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/project - list projects\n"
         "/project <name> - switch project\n"
         "/add_dir <path> - add extra directory\n\n"
-        "Model:\n"
-        "/model - show current model\n"
-        "/model <name> - switch model (opus, sonnet, haiku)\n\n"
+        "LLM:\n"
+        "/llm - show current provider\n"
+        "/llm <claude|codex> - switch provider\n"
+        "/model - show current provider model\n"
+        "/model <name> - set model for current provider\n\n"
         "Info:\n"
-        "/usage - plan usage & rate limits\n"
+        "/usage - Claude usage, or /status output when using Codex\n"
         "/status - version & account info\n"
         "/doctor - health check\n"
         "/history - recent exchanges\n"
-        "/cancel - stop running task\n"
+        "/cancel - stop running task (immediate)\n"
+        "Messages during a task run as side queries\n"
+        "/tool - toggle tool message streaming (default: off)\n"
         "/version - show bot version\n\n"
-        "Skills (forwarded to Claude):\n"
+        "Skills (best with Claude):\n"
         "/review /security_review /simplify\n"
         "/pr_comments /release_notes /init\n"
         "/debug /insights /batch\n\n"
@@ -511,10 +988,12 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
     chat_id = update.effective_chat.id
-    old = sessions.pop(chat_id, None)
+    provider = _get_provider(chat_id)
+    old = _get_session(chat_id, provider)
+    _set_session(chat_id, provider, None)
     _save_state()
     await reply(update,
-        f"Session cleared (was: {old[:12]}...)." if old else "Starting fresh."
+        f"{provider.capitalize()} session cleared (was: {old[:12]}...)." if old else f"Starting fresh with {provider}."
     )
 
 
@@ -522,27 +1001,32 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
     chat_id = update.effective_chat.id
+    provider = _get_provider(chat_id)
     args = " ".join(context.args) if context.args else ""
     if not args:
         await reply(update,"Usage: /resume <session_id>")
         return
     sid = args.strip()
-    if not _SESSION_ID_RE.match(sid):
+    if provider == "codex" and sid.lower() == "last":
+        sid = "last"
+    elif not _SESSION_ID_RE.match(sid):
         await reply(update, "Invalid session ID format.")
         return
-    sessions[chat_id] = sid
+    _set_session(chat_id, provider, sid)
     _save_state()
-    await reply(update, f"Resumed session: {sid[:12]}...")
+    await reply(update, f"{provider.capitalize()} session set to: {sid[:12]}...")
 
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
     chat_id = update.effective_chat.id
-    sid = sessions.get(chat_id)
+    provider = _get_provider(chat_id)
+    sid = _get_session(chat_id, provider)
     cwd = working_dirs.get(chat_id, DEFAULT_CWD)
-    model = models.get(chat_id, "default")
+    model = _get_model(chat_id, provider) or "default"
     msg = (
+        f"Provider: {provider}\n"
         f"Session: {sid or 'none'}\n"
         f"Directory: {cwd}\n"
         f"Model: {model}"
@@ -573,7 +1057,7 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 PROJECTS = {
     "tg_agent":   r"C:\Users\w0mb4\tg_agent",
-    "quotebot":   r"C:\Users\w0mb4\QuoteBot",
+    "quoteroo":   r"C:\Users\w0mb4\Quoteroo",
     "alphaforge": r"C:\Users\w0mb4\AlphaForge",
 }
 SUMMARIES_DIR = r"C:\Users\w0mb4\project-summaries"
@@ -608,11 +1092,50 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
         None
     )
 
+    provider = _get_provider(chat_id)
+
+    # Auto-summarize outgoing project if switching away
+    if current_project and current_project != args:
+        session_id = _get_session(chat_id, provider)
+        if session_id and provider == "claude":
+            lock = _get_lock(chat_id)
+            if lock.locked():
+                await update.message.reply_text("Waiting for current task before switching...")
+            async with lock:
+                await update.message.reply_text(f"Saving {current_project} summary...")
+                typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
+                try:
+                    loop = asyncio.get_running_loop()
+                    summary_result = await loop.run_in_executor(
+                        None, lambda: run_claude(
+                            "Summarize the current work in this project in 2-3 paragraphs. "
+                            "Focus on what was done, what's in progress, and any open questions. "
+                            "Output ONLY the summary, no preamble.",
+                            session_id=session_id, cwd=current_cwd,
+                            model=_get_model(chat_id, provider), chat_id=chat_id,
+                        )
+                    )
+                    summary_text = summary_result.get("text", "")
+                    if summary_text:
+                        os.makedirs(SUMMARIES_DIR, exist_ok=True)
+                        spath = os.path.join(SUMMARIES_DIR, f"{current_project}.md")
+                        with open(spath, "w", encoding="utf-8") as f:
+                            f.write(f"# {current_project}\n\n")
+                            f.write(f"Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n")
+                            f.write(summary_text)
+                except Exception as e:
+                    log.warning("Auto-summarize failed: %s", e)
+                finally:
+                    typing_task.cancel()
+
+        # Auto-clear session
+        _set_session(chat_id, provider, None)
+
     # Switch directory
     working_dirs[chat_id] = target
     _save_state()
 
-    msg = f"Switched to project: {args}\nDirectory: {target}"
+    msg = f"Switched to project: {args}\nDirectory: {target}\nSession cleared."
 
     # Load summary for new project if it exists
     summary_path = os.path.join(SUMMARIES_DIR, f"{args}.md")
@@ -625,9 +1148,6 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     else:
         msg += "\n\n(No saved summary for this project yet.)"
-
-    if current_project and current_project != args:
-        msg += f"\n\nTip: clear context when ready (/new clears Claude session)."
 
     await reply(update, msg)
 
@@ -642,36 +1162,58 @@ async def cmd_add_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # add_dir is passed as a CLI flag — store it and inform user
     await reply(update,
         f"Note: --add-dir is a CLI startup flag. Use /cd to change directory, "
-        f"or mention the path in your prompt and Claude will access it."
+        f"or mention the path in your prompt and the active CLI will access it."
     )
 
 
-MODEL_ALIASES = {
+async def cmd_llm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    args = " ".join(context.args).strip().lower() if context.args else ""
+    current = _get_provider(chat_id)
+
+    if not args:
+        await reply(update, f"Current provider: {current}")
+        return
+
+    if args not in SUPPORTED_PROVIDERS:
+        await reply(update, "Usage: /llm <claude|codex>")
+        return
+
+    providers[chat_id] = args
+    _save_state()
+    model = _get_model(chat_id, args) or "default"
+    session = _get_session(chat_id, args) or "none"
+    await reply(update, f"Provider set to: {args}\nModel: {model}\nSession: {session}")
+
+
+CLAUDE_MODEL_ALIASES = {
     "opus": "claude-opus-4-6",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
 
 # Ordered low → high for up/down switching
-MODEL_LADDER = [
+CLAUDE_MODEL_LADDER = [
     ("haiku", "claude-haiku-4-5-20251001"),
     ("sonnet", "claude-sonnet-4-6"),
     ("opus", "claude-opus-4-6"),
 ]
 
-DEFAULT_MODEL_ID = "claude-sonnet-4-6"
+DEFAULT_CLAUDE_MODEL_ID = "claude-sonnet-4-6"
 
 
 def _model_name(model_id: str) -> str:
     """Return a friendly name for a model ID."""
-    for name, mid in MODEL_LADDER:
+    for name, mid in CLAUDE_MODEL_LADDER:
         if mid == model_id:
             return f"{name.capitalize()} ({mid})"
     return model_id
 
 
 def _ladder_index(model_id: str) -> int:
-    for i, (_, mid) in enumerate(MODEL_LADDER):
+    for i, (_, mid) in enumerate(CLAUDE_MODEL_LADDER):
         if mid == model_id:
             return i
     return -1
@@ -681,43 +1223,48 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
     chat_id = update.effective_chat.id
+    provider = _get_provider(chat_id)
     args = " ".join(context.args).strip().lower() if context.args else ""
-    current = models.get(chat_id, DEFAULT_MODEL_ID)
+    current = _get_model(chat_id, provider)
+    if provider == "claude" and not current:
+        current = DEFAULT_CLAUDE_MODEL_ID
 
     if not args:
-        await reply(update, f"Current model: {_model_name(current)}")
+        pretty = _model_name(current) if provider == "claude" and current else current or "default"
+        await reply(update, f"Current {provider} model: {pretty}")
         return
 
-    if args == "up":
+    if provider == "claude" and args == "up":
         idx = _ladder_index(current)
         if idx < 0:
             idx = 0  # unknown model, start from bottom
-        if idx >= len(MODEL_LADDER) - 1:
+        if idx >= len(CLAUDE_MODEL_LADDER) - 1:
             await reply(update, f"Already on highest: {_model_name(current)}")
             return
-        _, new_id = MODEL_LADDER[idx + 1]
-        models[chat_id] = new_id
+        _, new_id = CLAUDE_MODEL_LADDER[idx + 1]
+        _set_model(chat_id, provider, new_id)
         _save_state()
         await reply(update, f"Upgraded to: {_model_name(new_id)}")
         return
 
-    if args == "down":
+    if provider == "claude" and args == "down":
         idx = _ladder_index(current)
         if idx < 0:
-            idx = len(MODEL_LADDER) - 1  # unknown model, start from top
+            idx = len(CLAUDE_MODEL_LADDER) - 1  # unknown model, start from top
         if idx <= 0:
             await reply(update, f"Already on lowest: {_model_name(current)}")
             return
-        _, new_id = MODEL_LADDER[idx - 1]
-        models[chat_id] = new_id
+        _, new_id = CLAUDE_MODEL_LADDER[idx - 1]
+        _set_model(chat_id, provider, new_id)
         _save_state()
         await reply(update, f"Downgraded to: {_model_name(new_id)}")
         return
 
-    model_id = MODEL_ALIASES.get(args, args)
-    models[chat_id] = model_id
+    model_id = CLAUDE_MODEL_ALIASES.get(args, args) if provider == "claude" else args
+    _set_model(chat_id, provider, model_id)
     _save_state()
-    await reply(update, f"Model set to: {_model_name(model_id)}")
+    pretty = _model_name(model_id) if provider == "claude" else model_id
+    await reply(update, f"{provider.capitalize()} model set to: {pretty}")
 
 
 # Friendly labels for known bucket keys; unknown keys shown as-is
@@ -732,6 +1279,9 @@ _BUCKET_LABELS = {
 
 async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
+        return
+    if _get_provider(update.effective_chat.id) != "claude":
+        await reply(update, _format_codex_usage(update.effective_chat.id))
         return
 
     loop = asyncio.get_running_loop()
@@ -761,37 +1311,56 @@ async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
+    chat_id = update.effective_chat.id
+    provider = _get_provider(chat_id)
+    if provider == "codex":
+        await reply(update, _format_codex_usage(chat_id))
+        return
+
     loop = asyncio.get_running_loop()
     def _get_ver():
         try:
             return subprocess.run(
-                ["claude", "--version"], capture_output=True, text=True, timeout=5
+                [_cli_bin(provider), "--version"], capture_output=True, text=True, timeout=5
             ).stdout.strip()
         except Exception:
             return "unknown"
     ver = await loop.run_in_executor(None, _get_ver)
 
-    chat_id = update.effective_chat.id
     await reply(update,
         f"Bot: v{VERSION} · {BUILD_ID}\n"
         f"Built: {BUILD_TIME}\n"
-        f"Claude CLI: {ver}\n"
-        f"Model: {models.get(chat_id, 'default')}\n"
+        f"Provider: {provider}\n"
+        f"{provider.capitalize()} CLI: {ver}\n"
+        f"Model: {_get_model(chat_id, provider) or 'default'}\n"
         f"Directory: {working_dirs.get(chat_id, DEFAULT_CWD)}\n"
-        f"Session: {sessions.get(chat_id, 'none')}"
+        f"Session: {_get_session(chat_id, provider) or 'none'}"
     )
+    return
 
 
 async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
+    provider = _get_provider(update.effective_chat.id)
     loop = asyncio.get_running_loop()
     def _run_doctor():
         try:
-            r = subprocess.run(
-                ["claude", "doctor"], capture_output=True, text=True, timeout=15
+            if provider == "claude":
+                r = subprocess.run(
+                    ["claude", "doctor"], capture_output=True, text=True, timeout=15
+                )
+                return (r.stdout + r.stderr).strip() or "No output."
+            ver = subprocess.run(
+                [_cli_bin("codex"), "--version"], capture_output=True, text=True, timeout=10
             )
-            return (r.stdout + r.stderr).strip() or "No output."
+            login = subprocess.run(
+                [_cli_bin("codex"), "login", "status"], capture_output=True, text=True, timeout=10
+            )
+            return (
+                f"Codex CLI: {(ver.stdout or ver.stderr).strip() or 'unknown'}\n"
+                f"{(login.stdout + login.stderr).strip() or 'No login status output.'}"
+            )
         except Exception as e:
             return f"Error: {e}"
     output = await loop.run_in_executor(None, _run_doctor)
@@ -828,13 +1397,156 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update, "Nothing running.")
 
 
+async def cmd_tool(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    current = _show_tools.get(chat_id, False)
+    _show_tools[chat_id] = not current
+    _save_state()
+    state = "ON" if _show_tools[chat_id] else "OFF"
+    await reply(update, f"Tool message streaming: {state}")
+
+
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
         return
     await reply(update, f"v{VERSION} · {BUILD_ID}")
 
 
+DEPLOY_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".deploy-lock")
+
+
+async def cmd_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle deploy lock — pauses the file-watcher auto-restart."""
+    if not await is_allowed(update):
+        return
+    if os.path.exists(DEPLOY_LOCK_FILE):
+        os.remove(DEPLOY_LOCK_FILE)
+        await reply(update, "🔓 Deploy lock removed — auto-restart resumed.")
+    else:
+        with open(DEPLOY_LOCK_FILE, "w") as f:
+            f.write("")
+        await reply(update, "🔒 Deploy lock set — auto-restart paused.\nUse /deploy again to unlock.")
+
+
+def _store_result_state(chat_id: int, provider: str, result: dict):
+    if result.get("session_id"):
+        _set_session(chat_id, provider, result["session_id"])
+    if result.get("cwd"):
+        working_dirs[chat_id] = result["cwd"]
+    _save_state()
+
+
 # ── Message handler (forwarding to Claude CLI) ─────────────────
+
+async def _run_with_streaming(chat_id: int, update: Update, prompt: str):
+    """Run a CLI agent with real-time streaming to Telegram."""
+    provider = _get_provider(chat_id)
+    cwd = working_dirs.get(chat_id, DEFAULT_CWD)
+    model = _get_model(chat_id, provider)
+    show_tools_flag = _show_tools.get(chat_id, False)
+
+    typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
+
+    # Create streaming queue for Claude provider
+    sq = queue.Queue() if provider == "claude" and _bot_ref else None
+    consumer_task = None
+    if sq:
+        consumer_task = asyncio.create_task(
+            _stream_consumer(chat_id, sq, _bot_ref, show_tools_flag)
+        )
+
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, lambda: run_agent(
+                provider, prompt, _get_session(chat_id, provider),
+                cwd, model, chat_id=chat_id, stream_queue=sq,
+            )
+        )
+    except subprocess.TimeoutExpired:
+        if sq:
+            sq.put(("done", ""))
+        if consumer_task:
+            await consumer_task
+        await reply(update, f"{provider.capitalize()} timed out (10 min limit).")
+        return
+    except Exception as e:
+        if sq:
+            sq.put(("done", ""))
+        if consumer_task:
+            await consumer_task
+        print(f">>> ERROR: {e}", flush=True)
+        await reply(update, f"Error: {e}")
+        return
+    finally:
+        typing_task.cancel()
+
+    # Wait for consumer to finish draining
+    streamed = False
+    if consumer_task:
+        streamed = await consumer_task
+
+    _store_result_state(chat_id, provider, result)
+
+    _record(chat_id, "user", prompt)
+    _record(chat_id, "bot", result["text"] or "(empty)")
+
+    # Only send final result if nothing was streamed
+    if not streamed:
+        await _send_message(update, result["text"])
+
+    if _bot_ref and provider == "claude":
+        asyncio.create_task(_check_usage_thresholds(_bot_ref))
+
+
+async def _run_btw(chat_id: int, update: Update, prompt: str):
+    """Run a side query (btw) without blocking or using the main session."""
+    provider = _get_provider(chat_id)
+    if provider != "claude":
+        await reply(update, "Side queries only work with Claude. This will run after the current task.")
+        return False  # signal: not handled
+
+    cwd = working_dirs.get(chat_id, DEFAULT_CWD)
+    model = _get_model(chat_id, provider)
+
+    c = COLORS
+    print(f"\n{c['yellow']}{c['bold']}You (btw):{c['reset']} {prompt}")
+    print(f"{c['dim']}  cwd: {cwd}{c['reset']}", flush=True)
+
+    # Fresh call, no session resume, no session save
+    cmd = ["claude", "-p", "--output-format", "json", "--dangerously-skip-permissions"]
+    if model:
+        cmd.extend(["--model", model])
+    cmd.append(prompt)
+
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, lambda: subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120,
+                cwd=cwd, encoding="utf-8", errors="replace",
+            )
+        )
+        stdout = result.stdout.strip()
+        try:
+            data = json.loads(stdout)
+            response = data.get("result", stdout)
+        except (json.JSONDecodeError, TypeError):
+            response = stdout or "No response."
+
+        print(f"{c['green']}{c['bold']}Claude (btw):{c['reset']} {response}", flush=True)
+        await _send_message(update, response)
+        _record(chat_id, "user", f"[btw] {prompt}")
+        _record(chat_id, "bot", response)
+    except subprocess.TimeoutExpired:
+        await reply(update, "Side query timed out.")
+    except Exception as e:
+        await reply(update, f"Side query error: {e}")
+
+    return True  # handled
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update):
@@ -848,43 +1560,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lock = _get_lock(chat_id)
 
     if lock.locked():
+        # Task is running — handle as a side query instead of queuing
+        handled = await _run_btw(chat_id, update, text)
+        if handled:
+            return
+        # If not handled (e.g. codex), fall through to queue
         await update.message.reply_text("Queued — waiting for current task to finish...")
 
     async with lock:
-        session_id = sessions.get(chat_id)
-        cwd = working_dirs.get(chat_id, DEFAULT_CWD)
-        model = models.get(chat_id)
-
-        typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
-
-        loop = asyncio.get_running_loop()
-        try:
-            result = await loop.run_in_executor(
-                None, lambda: run_claude(text, session_id, cwd, model, chat_id=chat_id)
-            )
-        except subprocess.TimeoutExpired:
-            await reply(update, "Claude timed out (10 min limit).")
-            return
-        except Exception as e:
-            print(f">>> ERROR: {e}", flush=True)
-            await reply(update, f"Error: {e}")
-            return
-        finally:
-            typing_task.cancel()
-
-        if result.get("session_id"):
-            sessions[chat_id] = result["session_id"]
-        if result.get("cwd"):
-            working_dirs[chat_id] = result["cwd"]
-        _save_state()
-
-        _record(chat_id, "user", text)
-        _record(chat_id, "bot", result["text"] or "(empty)")
-
-        # Don't use reply() here — run_claude already printed to terminal
-        await _send_message(update, result["text"])
-        if _bot_ref:
-            asyncio.create_task(_check_usage_thresholds(_bot_ref))
+        await _run_with_streaming(chat_id, update, text)
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -924,36 +1608,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Queued — waiting for current task to finish...")
 
         async with lock:
-            session_id = sessions.get(chat_id)
-            cwd = working_dirs.get(chat_id, DEFAULT_CWD)
-            model = models.get(chat_id)
-
-            typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
-
-            loop = asyncio.get_running_loop()
-            try:
-                result = await loop.run_in_executor(
-                    None, lambda: run_claude(prompt, session_id, cwd, model, chat_id=chat_id)
-                )
-            except Exception as e:
-                print(f">>> ERROR: {e}", flush=True)
-                await reply(update, f"Error: {e}")
-                return
-            finally:
-                typing_task.cancel()
-
-            if result.get("session_id"):
-                sessions[chat_id] = result["session_id"]
-            if result.get("cwd"):
-                working_dirs[chat_id] = result["cwd"]
-            _save_state()
-
-            _record(chat_id, "user", caption or "[file]")
-            _record(chat_id, "bot", result["text"] or "(empty)")
-
-            await _send_message(update, result["text"])
-            if _bot_ref:
-                asyncio.create_task(_check_usage_thresholds(_bot_ref))
+            await _run_with_streaming(chat_id, update, prompt)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1011,35 +1666,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Queued — waiting for current task to finish...")
 
         async with lock:
-            session_id = sessions.get(chat_id)
-            cwd = working_dirs.get(chat_id, DEFAULT_CWD)
-            model = models.get(chat_id)
-
-            typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
-
-            try:
-                result = await loop.run_in_executor(
-                    None, lambda: run_claude(text, session_id, cwd, model, chat_id=chat_id)
-                )
-            except Exception as e:
-                print(f">>> ERROR: {e}", flush=True)
-                await reply(update, f"Error: {e}")
-                return
-            finally:
-                typing_task.cancel()
-
-            if result.get("session_id"):
-                sessions[chat_id] = result["session_id"]
-            if result.get("cwd"):
-                working_dirs[chat_id] = result["cwd"]
-            _save_state()
-
-            _record(chat_id, "user", f"[voice] {text}")
-            _record(chat_id, "bot", result["text"] or "(empty)")
-
-            await _send_message(update, result["text"])
-            if _bot_ref:
-                asyncio.create_task(_check_usage_thresholds(_bot_ref))
+            await _run_with_streaming(chat_id, update, text)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1065,6 +1692,7 @@ def main():
     app.add_handler(CommandHandler("add_dir", cmd_add_dir))
 
     # Model
+    app.add_handler(CommandHandler("llm", cmd_llm))
     app.add_handler(CommandHandler("model", cmd_model))
 
     # Info
@@ -1073,7 +1701,9 @@ def main():
     app.add_handler(CommandHandler("doctor", cmd_doctor))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("tool", cmd_tool))
     app.add_handler(CommandHandler("version", cmd_version))
+    app.add_handler(CommandHandler("deploy", cmd_deploy))
 
     # Skills forwarded to CLI — registered as commands so Telegram
     # doesn't eat them; handler just forwards the text as-is
@@ -1093,7 +1723,7 @@ def main():
         _bot_ref = application.bot
         try:
             await application.bot.send_message(
-                chat_id=ALLOWED_USER_ID,
+                chat_id=OWNER_USER_ID,
                 text=f"Bot restarted — v{VERSION} · {BUILD_ID}\nLast changed: {BUILD_TIME}",
             )
         except Exception as e:
@@ -1121,19 +1751,26 @@ def _run_with_auto_reload():
     import threading
 
     SCRIPT = os.path.abspath(__file__)
-    RESTART_DELAY = 3
-    COOLDOWN = 5  # seconds to ignore mtime changes after restart
+    DEPLOY_LOCK = os.path.join(os.path.dirname(SCRIPT), ".deploy-lock")
+    RESTART_DELAY = 5
+    COOLDOWN = 30  # seconds to ignore mtime changes after restart
+    SETTLE_TIME = 10  # wait for file changes to settle before restarting
     c = COLORS
     proc = None
     file_changed = threading.Event()
     stop_watcher = threading.Event()
     cooldown_until = [0.0]  # mutable container for thread access
+    last_change_time = [0.0]  # track when last change was seen
 
     def _watch():
-        """Poll bot.py mtime every 2s, signal when it changes."""
+        """Poll bot.py mtime every 3s, signal when it changes (after settling)."""
         last_mtime = os.path.getmtime(SCRIPT)
         while not stop_watcher.is_set():
-            _time.sleep(2)
+            _time.sleep(3)
+            # Pause watcher while deploy lock exists
+            if os.path.exists(DEPLOY_LOCK):
+                last_mtime = os.path.getmtime(SCRIPT)
+                continue
             if _time.time() < cooldown_until[0]:
                 last_mtime = os.path.getmtime(SCRIPT)
                 continue
@@ -1141,6 +1778,13 @@ def _run_with_auto_reload():
                 current = os.path.getmtime(SCRIPT)
                 if current != last_mtime:
                     last_mtime = current
+                    last_change_time[0] = _time.time()
+                    # Don't restart yet — wait for changes to settle
+                    continue
+
+                # If a change was detected, wait SETTLE_TIME before triggering
+                if last_change_time[0] > 0 and (_time.time() - last_change_time[0]) >= SETTLE_TIME:
+                    last_change_time[0] = 0
                     print(f"\n{c['yellow']}{c['bold']}File change detected — restarting...{c['reset']}", flush=True)
                     file_changed.set()
                     if proc and proc.poll() is None:
@@ -1153,6 +1797,7 @@ def _run_with_auto_reload():
 
     while True:
         file_changed.clear()
+        last_change_time[0] = 0
         cooldown_until[0] = _time.time() + COOLDOWN
         print(f"{c['cyan']}Starting bot (pid will follow)...{c['reset']}", flush=True)
 
@@ -1165,7 +1810,7 @@ def _run_with_auto_reload():
 
         if file_changed.is_set():
             print(f"{c['cyan']}Reloading with updated code...{c['reset']}", flush=True)
-            _time.sleep(1)
+            _time.sleep(2)
             continue
 
         if proc.returncode == 0:
@@ -1190,3 +1835,4 @@ if __name__ == "__main__":
             _run_with_auto_reload()
         except KeyboardInterrupt:
             print(f"\n{COLORS['yellow']}Stopped by user.{COLORS['reset']}")
+
