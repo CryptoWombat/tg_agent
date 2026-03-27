@@ -226,7 +226,7 @@ async def _keep_typing(chat):
 def _escape_md2(text: str) -> str:
     """Escape special chars for Telegram MarkdownV2, preserving code blocks and inline code."""
     # Extract code blocks and inline code, escape everything else
-    SPECIAL = r'\_*[]()~`>#+=|{}.!-'
+    SPECIAL = r'_*[]()~`>#+=|{}.!-'
     parts = []
     pos = 0
     # Match ```...``` blocks and `...` inline code
