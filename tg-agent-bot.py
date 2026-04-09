@@ -22,7 +22,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 load_dotenv()
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 
 def _git_hash() -> str:
@@ -44,6 +44,7 @@ BUILD_TIME = datetime.fromtimestamp(
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OWNER_USER_ID = int(os.environ["TELEGRAM_USER_ID"])
 ALLOWED_USER_IDS = {OWNER_USER_ID, 517263385}
+WINDOW_TITLE = "TG Agent Bot"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -258,42 +259,65 @@ def _escape_md2(text: str) -> str:
     return ''.join(parts)
 
 
-async def _send_message(update: Update, text: str):
+async def _send_message(update: Update, text: str, add_indicator: bool = False):
     """Send a message with MarkdownV2 formatting, falling back to plain text."""
     if not text:
         text = "(empty response)"
+    last_msg = None
+    last_raw = None
     for i in range(0, len(text), MAX_MSG_LEN):
         chunk = text[i : i + MAX_MSG_LEN]
+        last_raw = chunk
         try:
-            await update.message.reply_text(
+            last_msg = await update.message.reply_text(
                 _escape_md2(chunk), parse_mode=ParseMode.MARKDOWN_V2
             )
         except Exception:
-            await update.message.reply_text(chunk)
+            try:
+                last_msg = await update.message.reply_text(chunk)
+            except Exception:
+                last_msg = None
+    if add_indicator and last_msg and last_raw:
+        try:
+            await last_msg.edit_text(
+                _escape_md2(last_raw + "\n\n↩️"),
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        except Exception:
+            pass  # non-fatal
 
 
 async def _send_to_chat(bot, chat_id: int, text: str):
-    """Send a message to a chat_id, with MarkdownV2 formatting and chunking."""
+    """Send a message to a chat_id, with MarkdownV2 formatting and chunking.
+    Returns (last_message_id, last_raw_chunk) or (None, None) if nothing sent."""
     if not text:
-        return
+        return None, None
+    last_id = None
+    last_raw = None
     for i in range(0, len(text), MAX_MSG_LEN):
         chunk = text[i : i + MAX_MSG_LEN]
+        last_raw = chunk
         try:
-            await bot.send_message(
+            msg = await bot.send_message(
                 chat_id=chat_id,
                 text=_escape_md2(chunk),
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
+            last_id = msg.message_id
         except Exception:
             try:
-                await bot.send_message(chat_id=chat_id, text=chunk)
+                msg = await bot.send_message(chat_id=chat_id, text=chunk)
+                last_id = msg.message_id
             except Exception:
-                pass
+                last_id = None
+    return last_id, last_raw
 
 
 async def _stream_consumer(chat_id: int, stream_queue: queue.Queue, bot, show_tools: bool):
     """Drain stream_queue and send messages to Telegram. Runs until 'done' sentinel."""
     streamed_any = False
+    last_msg_id = None
+    last_msg_text = None
     loop = asyncio.get_running_loop()
     while True:
         try:
@@ -303,14 +327,29 @@ async def _stream_consumer(chat_id: int, stream_queue: queue.Queue, bot, show_to
 
         etype = item[0]
         if etype == "done":
+            # Append reply indicator to the last response message
+            if last_msg_id and last_msg_text is not None:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=last_msg_id,
+                        text=_escape_md2(last_msg_text + "\n\n↩️"),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                    )
+                except Exception:
+                    pass  # non-fatal
             return streamed_any
 
         if etype == "text":
             text = item[1]
             if text.strip():
                 streamed_any = True
-                await _send_to_chat(bot, chat_id, text)
+                msg_id, msg_text = await _send_to_chat(bot, chat_id, text)
+                if msg_id:
+                    last_msg_id = msg_id
+                    last_msg_text = msg_text
         elif etype in ("tool", "tool_result") and show_tools:
+            # Don't track tool messages — indicator should go on the last response text
             await _send_to_chat(bot, chat_id, item[1])
 
     return streamed_any
@@ -417,10 +456,24 @@ def _format_tool_event(block: dict) -> str:
         return f"Tool: {tool}\n{summary}"
 
 
+if os.name == "nt":
+    import ctypes
+    _set_console_title = ctypes.windll.kernel32.SetConsoleTitleW
+else:
+    _set_console_title = None
+
+
+def _reset_title():
+    """Reset terminal title — Claude CLI keeps overwriting it."""
+    if _set_console_title:
+        _set_console_title(WINDOW_TITLE)
+
+
 def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None,
                      stream_queue: queue.Queue | None = None) -> dict:
     """Execute claude CLI once, return parsed result dict."""
     c = COLORS
+    _reset_title()
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, cwd=cwd, bufsize=1, encoding="utf-8", errors="replace",
@@ -443,6 +496,7 @@ def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None,
                 continue
             try:
                 event = json.loads(line)
+                _reset_title()
                 _print_event(event)
                 new_cwd = _detect_cwd_change(event, cwd)
                 if new_cwd:
@@ -478,6 +532,8 @@ def _run_claude_once(cmd: list, cwd: str, chat_id: int | None = None,
     finally:
         with _active_procs_lock:
             _active_procs.pop(chat_id, None)
+
+    _reset_title()
 
     # Detect cancellation: on Unix -9 (SIGKILL) or -15 (SIGTERM),
     # on Windows returncode 1 when no result was produced
@@ -1507,7 +1563,7 @@ async def _run_with_streaming(chat_id: int, update: Update, prompt: str):
 
     # Only send final result if nothing was streamed
     if not streamed:
-        await _send_message(update, result["text"])
+        await _send_message(update, result["text"], add_indicator=True)
 
     if _bot_ref and provider == "claude":
         asyncio.create_task(_check_usage_thresholds(_bot_ref))
