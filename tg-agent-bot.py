@@ -22,7 +22,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 load_dotenv()
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 
 def _git_hash() -> str:
@@ -246,6 +246,7 @@ def _escape_md2(text: str) -> str:
             parts.append(f'```{inner}```')
         else:
             inner = code[1:-1]
+            inner = inner.replace('\\', '\\\\').replace('`', '\\`')
             parts.append(f'`{inner}`')
         pos = m.end()
     # Escape remaining text
@@ -1041,7 +1042,7 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = " ".join(context.args) if context.args else ""
     if not args:
         cwd = working_dirs.get(chat_id, DEFAULT_CWD)
-        await reply(update,f"Current directory: {cwd}")
+        await reply(update,f"Current directory: `{cwd}`")
         return
     target = os.path.expanduser(args)
     if not os.path.isabs(target):
@@ -1050,15 +1051,19 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.isdir(target):
         working_dirs[chat_id] = target
         _save_state()
-        await reply(update,f"Changed to: {target}")
+        await reply(update,f"Changed to: `{target}`")
     else:
-        await reply(update,f"Not a directory: {target}")
+        await reply(update,f"Not a directory: `{target}`")
 
 
 PROJECTS = {
     "tg_agent":   r"C:\Users\w0mb4\tg_agent",
     "quoteroo":   r"C:\Users\w0mb4\Quoteroo",
     "alphaforge": r"C:\Users\w0mb4\AlphaForge",
+    # Note: konduktor-bot (C:\Users\w0mb4\konduktor-bot) is a separate Telegram bot
+    # for this project, structured similarly to tg_agent, running independently.
+    # GitHub: https://github.com/konduktor-dev/konduktor
+    "konduktor":  r"C:\Users\w0mb4\konduktor",
 }
 SUMMARIES_DIR = r"C:\Users\w0mb4\project-summaries"
 
@@ -1076,10 +1081,10 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
             None
         )
         if current_name:
-            await reply(update, f"Project: {current_name}\nDirectory: {current}")
+            await reply(update, f"Project: {current_name}\nDirectory: `{current}`")
         else:
-            names = "\n".join(f"  {k} → {v}" for k, v in PROJECTS.items())
-            await reply(update, f"No active project (cwd: {current})\n\nAvailable:\n{names}")
+            names = "\n".join(f"  {k} → `{v}`" for k, v in PROJECTS.items())
+            await reply(update, f"No active project (cwd: `{current}`)\n\nAvailable:\n{names}")
         return
 
     target = PROJECTS.get(args)
@@ -1089,7 +1094,7 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not os.path.isdir(target):
-        await reply(update, f"Directory not found: {target}")
+        await reply(update, f"Directory not found: `{target}`")
         return
 
     # Detect current project name from cwd
