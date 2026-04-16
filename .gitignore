@@ -1,4 +1,8 @@
-.env
+# Environment variables — catch-all pattern to prevent any `.env*` file
+# from being committed. Allowlist explicit `.env.example` and similar.
+.env*
+!.env.example
+!.env*.example
 state.json
 __pycache__/
 *.pyc
