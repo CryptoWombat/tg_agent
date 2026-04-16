@@ -1,0 +1,84 @@
+# Gitleaks config — used by .github/workflows/secret-scan.yml
+#
+# Extends the default ruleset (JWTs, AWS, GitHub, Slack, Stripe, etc.) and
+# adds project-specific rules for the key shapes we use:
+#   - Supabase new API keys (sb_secret_*, sb_publishable_*)
+#   - Supabase management tokens (sbp_*)
+#   - Telegram bot tokens (NNNNNNNN:AAxxxx)
+#   - GitHub PATs (classic + fine-grained) — covered by default but re-asserted
+#
+# Allowlist rules exist for known-false-positive files (test fixtures,
+# package-lock integrity hashes, skill-example markdown).
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "supabase-secret-api-key"
+description = "Supabase Secret API key (new format, sb_secret_*)"
+regex = '''sb_secret_[A-Za-z0-9_-]{24,}'''
+keywords = ["sb_secret_"]
+tags = ["secret", "supabase"]
+
+[[rules]]
+id = "supabase-publishable-api-key"
+description = "Supabase Publishable API key (new format, sb_publishable_*)"
+regex = '''sb_publishable_[A-Za-z0-9_-]{24,}'''
+keywords = ["sb_publishable_"]
+# Publishable keys are safe to expose to browsers when used WITH RLS,
+# but committing the literal value is still a bad habit — they should
+# come from env vars. Flag but treat as info.
+tags = ["info", "supabase"]
+
+[[rules]]
+id = "supabase-management-token"
+description = "Supabase Management API token (sbp_*)"
+regex = '''sbp_[a-f0-9]{32,}'''
+keywords = ["sbp_"]
+tags = ["secret", "supabase"]
+
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram Bot API token"
+regex = '''\b[0-9]{8,12}:AA[A-Za-z0-9_-]{30,40}\b'''
+keywords = [":AA"]
+tags = ["secret", "telegram"]
+
+[[rules]]
+id = "env-file-assignment-jwt"
+description = "Long JWT-shaped value assigned in an .env* file"
+regex = '''(?i)(supabase|service|anon|jwt|bearer|token)[_A-Z0-9]*\s*=\s*["']?eyJ[A-Za-z0-9_-]{40,}[\.][A-Za-z0-9_-]{20,}[\.][A-Za-z0-9_-]{20,}'''
+keywords = ["eyJ"]
+path = '''(?i)\.env($|\.)'''
+tags = ["secret", "jwt"]
+
+# ---------------------------------------------------------------------------
+# Allowlist — files that legitimately contain strings matching secret
+# patterns but are NOT real secrets.
+# ---------------------------------------------------------------------------
+[allowlist]
+description = "Known false positives in this repo"
+paths = [
+  # Sentry PII scrubber test fixtures — uses sample JWT + fake tokens
+  '''packages/sentry-config/tests/scrub\.test\.ts''',
+  # Lockfiles contain base64 integrity hashes that sometimes look like JWTs
+  '''pnpm-lock\.yaml''',
+  '''package-lock\.json''',
+  '''yarn\.lock''',
+  # Template .env.example files (and `.env*.example`) — placeholder values
+  '''\.env\.example''',
+  '''\.env.*\.example''',
+  # Example/documentation-only markdown with illustrative patterns
+  '''docs/.*\.md''',
+]
+
+# Specific short regex carve-outs for places where the rule above would
+# otherwise flag
+regexes = [
+  # Sentry scrub test fixtures (e.g. sk-ant-key12345, a deliberately-short
+  # sample JWT)
+  '''sk-ant-key12345''',
+  '''sk-ant-oat01-abc123def456ghiJKL_mnopqrst''',
+  # Sample JWT literally used in the Sentry scrub test
+  '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U''',
+]
