@@ -32,3 +32,39 @@
 ## Commands
 
 `/project`, `/llm`, `/model`, `/deploy`, `/cd`, `/cancel`, `/newsession`, `/status`, `/usage`, `/help`
+
+## NotebookLM discipline — MANDATORY, BI-DIRECTIONAL
+
+The full canonical rule lives in `~/.claude/CLAUDE.md` under "NotebookLM discipline — MANDATORY, non-negotiable, BI-DIRECTIONAL". Read it. The summary below is project-scoped.
+
+**tg_agent work uses notebook alias `tg-agent`.** Create on first use:
+```bash
+nlm notebook get tg-agent 2>/dev/null || {
+  NB_ID=$(nlm notebook create "Telegram Agent" --quiet)
+  nlm alias set tg-agent "$NB_ID"
+}
+```
+
+**Applies to**: every session, every spawned sub-agent, every scheduled task, every autonomous loop. There is no exempt context.
+
+**At session start**:
+1. `export PYTHONIOENCODING=utf-8 && (nlm login --check || nlm login --profile andrey)`
+2. Drain `/c/Users/w0mb4/.claude/nlm-pending/` (push each pending file to its project notebook by filename, delete on success)
+3. `nlm notebook query tg-agent "current state, deferred work, recent slash command changes"` — pull fresh context
+
+**At end of every shipped batch**:
+- `nlm source add tg-agent --text "$(cat /tmp/summary.md)" --title "tg_agent v<X.Y.Z> session — <YYYY-MM-DD>"` — versions, surfaces shipped, vault touched, deferred work, process learnings.
+- For CLAUDE.md / slash command additions / session-handler changes → push fresh source titled `tg_agent <docname> (current — <YYYY-MM-DD>)`
+- For new bot tokens / env vars → push source `tg_agent infra <YYYY-MM-DD>`
+
+**On sync failure**: do NOT block work. Retry 3× → re-auth once → spool to `/c/Users/w0mb4/.claude/nlm-pending/<timestamp>-tg-agent.md` → keep working → end response with red flag IN ALL CAPS:
+
+```
+🚨 NLM SYNC FAILED 🚨
+Pending summary at: /c/Users/w0mb4/.claude/nlm-pending/<filename>
+Last error: <one line>
+```
+
+**Autonomous mode is not exempt.** Keep retrying opportunistically and surface the failure in the run's reporting channel.
+
+**If you ship and skip NLM, the work is unfinished. No exceptions.**
