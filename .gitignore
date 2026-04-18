@@ -8,3 +8,25 @@ __pycache__/
 *.pyc
 .deploy-lock
 .codex-home/
+
+# BEGIN @konduktor/secret-guards (do not remove)
+# Canonical secret-leak guardrail block. Update via:
+#   bash <konduktor>/packages/secret-guards/bin/install.sh
+
+# Secrets — broad catch-all. Only .env.example / .env*.example are
+# allowlisted below. This covers .env, .env.local, .env.production,
+# .env.local.pre-relocate, .env.whatever-tool-output, etc.
+.env*
+!.env.example
+!.env*.example
+
+# Claude Code local settings — may contain secret literals in the
+# permission allowlist (e.g. Bash entries with inline env vars).
+# NEVER commit these. Exact scenario that leaked TalentSignal's
+# WDAO Supabase management token 2026-04-18.
+.claude/
+
+# Cursor / editor session state
+.cursor/
+
+# END @konduktor/secret-guards

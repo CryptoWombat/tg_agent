@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Pre-commit guard — blocks a commit if any staged file looks like a secret
+# leak. Fast feedback loop before the CI workflow catches it.
+#
+# Enable for your local clone by running:
+#   git config --local core.hooksPath .githooks
+#
+# The same patterns are authoritative in .gitleaks.toml which runs in CI.
+# This hook is a SUBSET check — deliberately narrow + fast. If it passes
+# and CI fails, trust CI; tune patterns in .gitleaks.toml.
+#
+# Bypass (only when you know what you're doing):
+#   git commit --no-verify   # NEVER do this for anything env-file-shaped
+
+set -u
+
+red() { printf "\033[31m%s\033[0m" "$*"; }
+yellow() { printf "\033[33m%s\033[0m" "$*"; }
+green() { printf "\033[32m%s\033[0m" "$*"; }
+
+# Files this commit is staging (both new + modified, excluding deletions)
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+if [ -z "$staged" ]; then
+  exit 0
+fi
+
+fail=0
+
+# ---------------------------------------------------------------------------
+# Rule 1 — any .env* file except .env.example / .env*.example
+# ---------------------------------------------------------------------------
+while IFS= read -r f; do
+  case "$f" in
+    *.env.example|*.env*.example)
+      continue
+      ;;
+    */.env|*/.env.*|.env|.env.*)
+      red ">> BLOCKED: staging an env file: "
+      echo "$f"
+      echo "   Env files must NEVER be committed. Add the pattern to .gitignore."
+      echo "   If this is a legitimate template, rename it to end with .example"
+      fail=1
+      ;;
+  esac
+done <<< "$staged"
+
+# ---------------------------------------------------------------------------
+# Rule 2 — staged content contains obvious credential shapes
+# ---------------------------------------------------------------------------
+# Patterns we care about — keep tight to avoid false positives. Real enforcement
+# is in gitleaks CI; this is just the fast local canary.
+patterns=(
+  '\bsb_secret_[A-Za-z0-9_-]{24,}'                    # Supabase secret API key
+  '\bsbp_[a-f0-9]{32,}'                               # Supabase management token
+  '\bghp_[A-Za-z0-9]{30,}'                            # GitHub classic PAT
+  '\bgithub_pat_[A-Za-z0-9_]{50,}'                    # GitHub fine-grained PAT
+  '\bsk-ant-(oat01|api03)-[A-Za-z0-9_-]{30,}'         # Anthropic API keys (real)
+  '\bsk-proj-[A-Za-z0-9_-]{30,}'                      # OpenAI project keys
+  '\bAKIA[0-9A-Z]{16}\b'                              # AWS access key
+  '\b[0-9]{9,12}:AA[A-Za-z0-9_-]{33,}'                # Telegram bot token
+)
+
+for p in "${patterns[@]}"; do
+  # Scan the staged diff (not full files — only what's being added)
+  match=$(git diff --cached -U0 --no-color | grep -nE "$p" | grep -v '^---' | grep -v '^+++' | head -3)
+  if [ -n "$match" ]; then
+    red ">> BLOCKED: staged diff contains a credential-shaped pattern: "
+    echo "$p"
+    echo "   Sample (redacted preview):"
+    echo "$match" | sed -E 's/([a-zA-Z0-9_-]{12})[a-zA-Z0-9_-]*/\1.../g' | head -3
+    fail=1
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+if [ "$fail" -eq 1 ]; then
+  echo
+  yellow "Commit aborted. Fix the issues above, then re-stage and retry."
+  echo
+  echo "Emergency bypass (NOT for env files): git commit --no-verify"
+  echo "(CI will still run gitleaks and block the push if you do.)"
+  exit 1
+fi
+
+green "pre-commit: no env-file or credential shapes detected."
+echo
+exit 0
