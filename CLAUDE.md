@@ -35,7 +35,9 @@
 
 ## NotebookLM discipline — MANDATORY, BI-DIRECTIONAL
 
-The full canonical rule lives in `~/.claude/CLAUDE.md` under "NotebookLM discipline — MANDATORY, non-negotiable, BI-DIRECTIONAL". Read it. The summary below is project-scoped.
+**Canonical spec:** https://github.com/konduktor-dev/konduktor/blob/main/docs/nlm-discipline.md — defines the taxonomy (`STATE`, `INFRA`, `PITFALL #N`, `DECISION`, `RUNBOOK`, `DOC`, `LOG`, `INDEX`) + session-start/session-end checklists. Read it before any significant NLM write. Sources titled `tg_agent v<X.Y.Z> session — <date>` are the old anti-pattern — use `LOG — <date> — <scope>` instead.
+
+The full global rule lives in `~/.claude/CLAUDE.md` under "NotebookLM discipline — MANDATORY, non-negotiable, BI-DIRECTIONAL". Read it. The summary below is project-scoped.
 
 **tg_agent work uses notebook alias `tg-agent`.** Create on first use:
 ```bash
