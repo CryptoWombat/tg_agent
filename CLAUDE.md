@@ -24,9 +24,9 @@
 
 ## Key Patterns
 
-- `bot.py` (~1850 lines) — main bot, auto-reloads on file change
+- `tg-agent-bot.py` — main bot, auto-reloads on file change (file watcher polls mtime every 3s)
 - `state.json` — per-chat persistent state (sessions, dirs, history, models)
-- `project-summaries/` — centralized summaries, auto-generated on `/project` switch
+- `project-summaries/` — centralised summaries, auto-generated on `/project` switch
 - Session persistence via Claude CLI `--resume`
 
 ## Commands
@@ -51,13 +51,21 @@ nlm notebook get tg-agent 2>/dev/null || {
 
 **At session start**:
 1. `export PYTHONIOENCODING=utf-8 && (nlm login --check || nlm login --profile andrey)`
-2. Drain `/c/Users/w0mb4/.claude/nlm-pending/` (push each pending file to its project notebook by filename, delete on success)
-3. `nlm notebook query tg-agent "current state, deferred work, recent slash command changes"` — pull fresh context
+2. Drain `/c/Users/w0mb4/.claude/nlm-pending/` (push each pending file to its project notebook, delete on success)
+3. `nlm source list tg-agent` — verify exactly 9 sources; consolidate if more
+4. Read `INDEX — Telegram Agent`, then `STATE — Telegram Agent`, then `BACKLOG — Telegram Agent`
+5. Query `INFRA`, `PITFALLS`, `DECISIONS`, `RUNBOOKS`, `DOCS` only as needed
 
-**At end of every shipped batch**:
-- `nlm source add tg-agent --text "$(cat /tmp/summary.md)" --title "tg_agent v<X.Y.Z> session — <YYYY-MM-DD>"` — versions, surfaces shipped, vault touched, deferred work, process learnings.
-- For CLAUDE.md / slash command additions / session-handler changes → push fresh source titled `tg_agent <docname> (current — <YYYY-MM-DD>)`
-- For new bot tokens / env vars → push source `tg_agent infra <YYYY-MM-DD>`
+**At end of every shipped batch** — update the matching canonical 9-slot source (no new sources):
+- Prod version or active work changed → replace `STATE — Telegram Agent`
+- Env vars / hosts changed → replace `INFRA — Telegram Agent`
+- New pitfall → append `## PITFALL #N — <name>` section to `PITFALLS — Telegram Agent`
+- New decision → append `## DECISION — <topic> (YYYY-MM-DD)` section to `DECISIONS — Telegram Agent`
+- Canonical doc path changed → update row in `DOCS — Telegram Agent` (TOC table only — no content snapshots)
+- Always prepend `## YYYY-MM-DD — <scope>` to `LOG — Telegram Agent`
+- Regenerate `INDEX — Telegram Agent` if any non-LOG source changed
+
+Sources titled `tg_agent v<X.Y.Z> session — <date>`, `tg_agent CLAUDE.md (current — …)`, or `tg_agent infra <date>` are the **old anti-pattern** — never create them. Everything goes into the 9 canonical slots.
 
 **On sync failure**: do NOT block work. Retry 3× → re-auth once → spool to `/c/Users/w0mb4/.claude/nlm-pending/<timestamp>-tg-agent.md` → keep working → end response with red flag IN ALL CAPS:
 
